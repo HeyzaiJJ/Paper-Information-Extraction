@@ -1,0 +1,75 @@
+{
+  "output_format": "markdown",
+  "force_ocr": false,
+  "paginate_output": false,
+
+  "page_range": null,
+
+  "extract_images": true,
+  "pdftext_workers": 1,
+  "disable_ocr": false,
+  "strip_existing_ocr": false,
+  "flatten_pdf": true,
+  "disable_links": false,
+  "keep_chars": false,
+  "disable_tqdm": false,
+
+
+  "lowres_image_dpi": 96,
+  "highres_image_dpi": 192,
+  "image_threshold": 0.65,
+
+  "layout_batch_size": null,
+
+  "layout_coverage_threshold": 0.25,
+  "layout_coverage_min_lines": 1,
+  "force_layout_block": null,
+  "expand_block_types": ["Picture", "Figure", "ComplexRegion"],
+  "max_expand_frac": 0.25,
+
+
+  "detection_batch_size": null,
+
+  "detection_line_min_confidence": 0.8,
+  "min_document_ocr_threshold": 0.85,
+  "provider_line_provider_line_min_overlap_pct": 0.1,
+
+
+  "recognition_batch_size": null,
+  "ocr_error_batch_size": null,
+
+  "ocr_task_name": "ocr_with_boxes",
+  "disable_ocr_math": false,
+  "drop_repeated_text": false,
+  "skip_ocr_blocks": ["Equation", "Figure", "Picture", "Table", "Form", "TableOfContents"],
+  "full_ocr_block_types": ["SectionHeader", "ListItem", "Footnote", "Text", "TextInlineMath", "Code", "Caption"],
+  "block_mode_intersection_thresh": 0.5,
+  "block_mode_max_lines": 15,
+  "block_mode_max_height_frac": 0.5,
+
+
+  "table_rec_batch_size": null,
+
+  "row_split_threshold": 0.5,
+  "drop_repeated_table_text": false,
+  "disable_ocr_math_table": false,
+
+
+  "equation_batch_size": null,
+
+
+  "use_llm": false,
+  "llm_service": "marker.services.gemini.GoogleGeminiService",
+  "gemini_api_key": "",
+  "openai_api_key": "",
+  "openai_base_url": "",
+
+  "debug_pdf_images": false,
+  "debug_layout_images": true,
+  "debug_json": true,
+  "debug_data_folder": "",
+
+  "ocr_space_threshold": 0.7,
+  "ocr_newline_threshold": 0.6,
+  "ocr_alphanum_threshold": 0.3
+}

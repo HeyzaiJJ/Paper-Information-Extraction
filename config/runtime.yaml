@@ -1,0 +1,47 @@
+marker:
+  required_version: "2.0.0"
+  mode: balanced
+  pdftext_workers: 1
+  extract_images: true
+  image_extraction_mode: highres
+  disable_tqdm: true
+  use_llm: false
+
+remote_inference:
+  backend: vllm
+  base_url: "http://192.168.11.13:8000/v1"
+  autostart: false
+  parallel: 8
+  timeout_seconds: 600
+  api_key_env: SURYA_VLLM_API_KEY
+
+local_ocr_error:
+  enabled: true
+  device: cpu
+  host: "127.0.0.1"
+  port: 8101
+  autostart: true
+  startup_timeout_seconds: 300
+  request_timeout_seconds: 600
+  max_batch: 64
+
+fast_layout:
+  enabled: false
+  autostart: false
+
+conversion:
+  max_concurrent_pdfs: 3
+  queue_size: 100
+  max_files_per_batch: 50
+  staging_ttl_hours: 24
+  export_ttl_hours: 24
+
+storage:
+  database_url: "sqlite:///data/marker_web.sqlite3"
+  image_backend: database
+  vlm_max_edge: 2048
+  thumbnail_max_edge: 600
+
+export:
+  image_directory: images
+  include_marker_metadata: true

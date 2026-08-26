@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ title }}</title>
+  <link rel="stylesheet" href="/static/style.css?v=20260820-plain-report15">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/katex.min.css">
+  <!-- 用于把 markdown 渲染成可读预览；离线时自动降级为纯文本 -->
+</head>
+<body>
+  <div class="layout">
+
+    <!-- ========== 左侧选择栏 ========== -->
+    <aside class="sidebar">
+      <div class="sidebar-title">功能选择</div>
+      <button type="button" class="nav-btn active" id="nav-pdf" data-ws="ws-pdf">
+        <span class="nav-icon">📄</span> PDF文件转换
+      </button>
+      <button type="button" class="nav-btn" id="nav-material" data-ws="ws-material">
+        <span class="nav-icon">🧪</span> 针对材料信息提取
+      </button>
+      <button type="button" class="nav-btn" id="nav-knowledge" data-ws="ws-knowledge">
+        <span class="nav-icon">🗂️</span> 知识库
+      </button>
+      <button type="button" class="nav-btn is-hidden" id="nav-paper" data-ws="ws-paper">
+        <span class="nav-icon">🔎</span> 论文信息提取
+      </button>
+    </aside>
+
+    <!-- ========== 右侧工作区 ========== -->
+    <main class="main">
+
+      <!-- ======== 工作区 1：PDF 文件转换（默认显示） ======== -->
+      <section class="workspace" id="ws-pdf">
+        <div class="wrap">
+          <div class="pdf-control-area">
+            <h1>PDF 文件转换</h1>
+            <div class="card">
+              <form id="convert-form">
+                <label>选择 PDF（可多选；点每个文件右侧的 × 删除单个）</label>
+                <div class="dropzone" id="dropzone">
+                  <input type="file" id="file-input" accept="application/pdf" multiple hidden>
+                  <button type="button" class="choose" id="choose-btn">＋ 选择文件</button>
+                  <span class="dz-tip">点击选择，或把 PDF 拖到此处</span>
+                </div>
+                <ul class="file-list" id="file-list"></ul>
+
+                <button type="submit" id="submit-btn">转换</button>
+                <div class="progress-list is-hidden" id="progress"></div>
+                <div class="tip">固定使用 Marker 2.0 balanced 模式，最多同时转换 3 篇。完成后直接下载 ZIP；每篇论文包含 Markdown、元数据和独立 images 文件夹。</div>
+                <div class="status" id="status"></div>
+              </form>
+            </div>
+          </div>
+
+          <!-- 转换区不再渲染 Markdown/HTML 预览，只显示 ZIP 下载入口。 -->
+          <div class="pdf-results" id="pdf-results">
+            <div id="runs"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ======== 工作区 2：论文信息提取（聊天形式） ======== -->
+      <section class="workspace is-hidden" id="ws-paper">
+        <div class="chat-layout">
+
+          <!-- 左侧：历史对话 -->
+          <aside class="chat-side">
+            <div class="chat-history-wrap" style="flex:1">
+              <button type="button" class="new-chat-btn" id="new-chat-btn">＋ 新对话</button>
+              <div class="chat-side-title">历史对话</div>
+              <div class="chat-history" id="chat-history">
+                <div class="chat-history-empty" id="chat-history-empty">暂无历史对话</div>
+              </div>
+            </div>
+          </aside>
+
+          <!-- 右侧：聊天栏 -->
+          <div class="chat-main">
+            <div class="chat-messages" id="chat-messages">
+              <div class="chat-welcome" id="chat-welcome">
+                <div class="chat-welcome-icon">🔎</div>
+                <div class="chat-welcome-title">论文信息提取</div>
+                <div class="chat-welcome-tip">
+                  点击下方「📁 已转换文件」选择 PDF 工作区已转换的论文，或用「＋」上传本地 md/pdf；<br>
+                  选中后在输入框输入消息并点击「发送」即可开始对话（功能开发中）。
+                </div>
+              </div>
+            </div>
+
+            <div class="chat-input-area">
+              <div class="chat-tools">
+                <button type="button" class="tool-btn" id="conv-files-btn">📁 已转换文件</button>
+                <button type="button" class="tool-btn tool-plus" id="plus-btn" title="上传本地 md / pdf">＋</button>
+                <input type="file" id="paper-file-input-chat" accept=".pdf,.md,.txt" multiple hidden>
+              </div>
+
+              <!-- 「已转换文件」弹出面板 -->
+              <div class="attach-panel is-hidden" id="attach-panel">
+                <div class="attach-panel-title">已转换文件</div>
+                <div class="attach-panel-list" id="attach-panel-list"></div>
+              </div>
+
+              <div class="attach-chips" id="attach-chips"></div>
+
+              <div class="chat-input-row">
+                <textarea class="chat-input" id="chat-input" rows="1" placeholder="输入消息…（Enter 发送，Shift+Enter 换行）"></textarea>
+                <button type="button" class="send-btn" id="send-btn">发送</button>
+              </div>
+            </div>
+          </div>
+
+        </div>
+      </section>
+
+      <!-- ======== 工作区 3：针对材料信息提取（V2） ======== -->
+      <section class="workspace is-hidden" id="ws-material">
+        <div id="material-workspace-v2">
+          <section class="mw-shell" aria-label="材料信息提取工作区">
+            <main class="mw-main">
+              <header class="mw-header"><div><h2>材料信息提取</h2></div><div class="mw-header-status"><span class="mw-dot" aria-hidden="true"></span><span id="mw-header-status-text">暂无提取任务</span></div></header>
+              <div class="mw-result-stage">
+                <section class="mw-control" id="mw-control" aria-label="提取控制区">
+                  <div class="mw-control-body" id="mw-control-body"><table class="mw-files-table"><thead><tr><th scope="col"><span class="mw-sr-only">选择</span></th><th scope="col">文件名</th><th scope="col">提取部分</th><th scope="col">PDF 解析</th><th scope="col">操作</th></tr></thead><tbody id="mw-files-body"></tbody></table><div class="mw-empty-note" id="mw-files-empty">暂无 PDF。请先在 PDF 文件转换工作区转换并加入材料提取，或继续添加本地 PDF。</div></div>
+                  <div class="mw-control-foot">
+                    <div class="mw-add-file-row">
+                      <button class="mw-link-button" type="button" id="mw-add-file"><i data-lucide="plus" aria-hidden="true"></i><span>继续添加 PDF</span></button>
+                      <input type="file" id="mw-add-file-input" accept="application/pdf,.pdf" multiple hidden>
+                    </div>
+                    <div class="mw-extraction-options-row">
+                      <div class="mw-part-picker">
+                        <div class="mw-part-selection">
+                          <span class="mw-part-title">按文件选择提取部分</span>
+                          <span class="mw-part-hint">在每个文件行单独勾选所需部分；启动、进度、取消和结果均按“文件 + 部分”独立处理。</span>
+                        </div>
+                      </div>
+                      <div class="mw-execute-row"><button class="mw-start" id="mw-start" type="button" disabled>请选择</button><select class="mw-select" id="mw-model" aria-label="选择模型"></select></div>
+                    </div>
+                  </div>
+                </section>
+                <section class="mw-results" aria-label="提取结果"><header class="mw-results-head"><h3>提取结果</h3><span id="mw-results-count">0 个文件</span></header><div class="mw-results-grid"><div class="mw-result-list" id="mw-result-list" role="listbox" aria-label="结果文件"></div><article class="mw-detail" id="mw-detail" aria-live="polite"><div class="mw-detail-empty mw-empty-note" id="mw-detail-empty">选择左侧结果文件查看报告。</div><div class="mw-detail-content is-hidden" id="mw-detail-content"><div class="mw-detail-head"><div class="mw-detail-title"><h3 id="mw-detail-name"></h3></div><div class="mw-detail-actions"><button class="mw-action-button" id="mw-export" type="button" data-tooltip="导出报告"><i data-lucide="download" aria-hidden="true"></i><span>导出</span></button><button class="mw-action-button" id="mw-archive" type="button" data-tooltip="归档到知识库"><i data-lucide="archive" aria-hidden="true"></i><span>归档</span></button></div></div><div class="mw-tab-row" id="mw-tab-row" role="tablist" aria-label="报告部分" aria-multiselectable="false"></div><div class="mw-report" id="mw-report"></div></div></article></div></section>
+              </div>
+            </main>
+          </section>
+          <div class="material-legacy-compat is-hidden" aria-hidden="true"><button type="button" id="mat-extract-btn">提取</button><div id="mat-file-list"></div><div id="mat-col-files"></div><div id="mat-col-info"></div><div id="mat-col-orig"></div><div id="mat-split-1"></div><div id="mat-split-2"></div><div id="mat-info-body"></div><button type="button" id="mat-export-btn">导出</button><button type="button" id="mat-plus-btn">＋ 添加本地 PDF</button><input type="file" id="mat-file-input" accept="application/pdf,.pdf" multiple><select id="mat-model-select"></select></div>
+        </div>
+      </section>
+
+      <!-- ======== 工作区 4：知识库（当前仅在页面会话中保存） ======== -->
+      <section class="workspace is-hidden" id="ws-knowledge">
+        <div class="knowledge-layout" id="knowledge-layout">
+          <aside class="knowledge-tree-panel" aria-label="知识库目录">
+            <div class="knowledge-tree-head">
+              <div>
+                <h1 class="knowledge-title">知识库</h1>
+                <p class="knowledge-subtitle">手工归档的分析报告</p>
+              </div>
+              <button type="button" class="knowledge-icon-btn" id="knowledge-new-folder-icon" title="新建归档文件夹" aria-label="新建归档文件夹">＋</button>
+            </div>
+            <div class="knowledge-search-wrap">
+              <input type="search" id="knowledge-search" class="knowledge-search" placeholder="搜索文件夹或论文" aria-label="搜索文件夹或论文">
+            </div>
+            <div class="knowledge-tree" id="knowledge-tree"></div>
+          </aside>
+
+          <div class="knowledge-splitter" id="knowledge-splitter" role="separator" aria-orientation="vertical" aria-label="调整知识库目录宽度"></div>
+
+          <section class="knowledge-content" id="knowledge-content" aria-live="polite"></section>
+        </div>
+      </section>
+
+      <dialog class="export-dialog" id="mat-export-dialog" aria-labelledby="mat-export-dialog-title">
+        <form method="dialog" class="export-dialog-form">
+          <div class="export-dialog-head">
+            <div>
+              <h2 id="mat-export-dialog-title">选择分析报告</h2>
+              <p>选择一份分析报告后导出 Markdown 文件。</p>
+            </div>
+            <button type="button" class="export-dialog-close" id="mat-export-cancel" aria-label="关闭导出菜单" title="关闭">×</button>
+          </div>
+          <div class="export-report-list" id="mat-export-report-list"></div>
+          <div class="export-dialog-actions">
+            <button type="button" class="export-dialog-cancel" id="mat-export-cancel-bottom">取消</button>
+            <button type="button" class="export-dialog-confirm" id="mat-export-confirm" disabled>导出</button>
+          </div>
+        </form>
+      </dialog>
+
+      <dialog class="knowledge-dialog" id="knowledge-folder-dialog" aria-labelledby="knowledge-folder-dialog-title">
+        <form method="dialog" class="knowledge-dialog-form" id="knowledge-folder-form">
+          <div class="knowledge-dialog-head">
+            <div>
+              <h2 id="knowledge-folder-dialog-title">新建归档文件夹</h2>
+              <p id="knowledge-folder-dialog-copy">文件夹中的报告仅由你主动归档。</p>
+            </div>
+            <button type="button" class="knowledge-dialog-close" id="knowledge-folder-cancel-icon" title="关闭" aria-label="关闭">×</button>
+          </div>
+          <div class="knowledge-dialog-body">
+            <label for="knowledge-folder-name">文件夹名称</label>
+            <input type="text" id="knowledge-folder-name" maxlength="80" autocomplete="off" placeholder="例如：磁性材料">
+            <p class="knowledge-field-error is-hidden" id="knowledge-folder-error"></p>
+          </div>
+          <div class="knowledge-dialog-actions">
+            <button type="button" class="knowledge-dialog-cancel" id="knowledge-folder-cancel">取消</button>
+            <button type="submit" class="knowledge-dialog-confirm" id="knowledge-folder-confirm">创建文件夹</button>
+          </div>
+        </form>
+      </dialog>
+
+      <dialog class="knowledge-dialog" id="knowledge-archive-dialog" aria-labelledby="knowledge-archive-dialog-title">
+        <form method="dialog" class="knowledge-dialog-form" id="knowledge-archive-form">
+          <div class="knowledge-dialog-head">
+            <div>
+              <h2 id="knowledge-archive-dialog-title">归档到知识库</h2>
+              <p id="knowledge-archive-dialog-copy">选择一个或多个归档文件夹。</p>
+            </div>
+            <button type="button" class="knowledge-dialog-close" id="knowledge-archive-cancel-icon" title="关闭" aria-label="关闭">×</button>
+          </div>
+          <div class="knowledge-dialog-body knowledge-archive-body">
+            <input type="search" id="knowledge-archive-search" class="knowledge-search" placeholder="搜索归档文件夹" aria-label="搜索归档文件夹">
+            <div class="knowledge-archive-list" id="knowledge-archive-list"></div>
+            <div class="knowledge-archive-empty is-hidden" id="knowledge-archive-empty">
+              <p>暂无归档文件夹。</p>
+              <p>请先在知识库新建归档文件夹。</p>
+              <button type="button" class="knowledge-empty-action" id="knowledge-archive-go-create">前往知识库新建</button>
+            </div>
+          </div>
+          <div class="knowledge-dialog-actions">
+            <span class="knowledge-selection-count" id="knowledge-archive-selection-count">已选择 0 个文件夹</span>
+            <button type="button" class="knowledge-dialog-cancel" id="knowledge-archive-cancel">取消</button>
+            <button type="submit" class="knowledge-dialog-confirm" id="knowledge-archive-confirm" disabled>确认归档</button>
+          </div>
+        </form>
+      </dialog>
+
+      <dialog class="knowledge-dialog knowledge-delete-dialog" id="knowledge-delete-dialog" aria-labelledby="knowledge-delete-dialog-title">
+        <form method="dialog" class="knowledge-dialog-form">
+          <div class="knowledge-dialog-head">
+            <div>
+              <h2 id="knowledge-delete-dialog-title">删除归档文件夹？</h2>
+              <p id="knowledge-delete-dialog-copy"></p>
+            </div>
+            <button type="button" class="knowledge-dialog-close" id="knowledge-delete-cancel-icon" title="关闭" aria-label="关闭">×</button>
+          </div>
+          <div class="knowledge-dialog-actions">
+            <button type="button" class="knowledge-dialog-cancel" id="knowledge-delete-cancel">取消</button>
+            <button type="button" class="knowledge-dialog-danger" id="knowledge-delete-confirm">删除文件夹</button>
+          </div>
+        </form>
+      </dialog>
+
+    </main>
+  </div>
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/katex.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/contrib/auto-render.min.js"></script>
+  <script src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js"></script>
+  <script src="/static/app.js?v=20260820-file-part-isolation1"></script>
+  <script src="/static/material-workspace-preview.js?v=20260820-file-part-isolation1"></script>
+</body>
+</html>
+
+
+
+
+
+
+
+
+
+
+
+
