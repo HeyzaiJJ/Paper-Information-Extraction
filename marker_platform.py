@@ -21,6 +21,7 @@ from html import unescape as html_unescape
 from html.parser import HTMLParser
 import io
 import json
+import logging
 import multiprocessing
 import os
 import queue
@@ -49,6 +50,14 @@ from runtime_config import (
     marker_config_values,
     prewarm_local_ocr_error,
     validate_marker_version,
+)
+from logging_setup import (
+    bind_log_context,
+    configure_main_logging,
+    configure_worker_logging,
+    get_log_queue,
+    reset_log_context,
+    shutdown_logging,
 )
 
 # Surya 在 import 时缓存 settings；必须先由项目配置写环境变量。
@@ -91,10 +100,14 @@ from knowledge_db import (
     get_report,
     init_database,
     knowledge_asset,
+    manage_reports_in_folder,
     knowledge_snapshot,
     remove_report_from_folder,
     update_folder,
 )
+
+logger = logging.getLogger("paper")
+access_logger = logging.getLogger("paper.access")
 
 # 调大 Starlette multipart 单 part 上限（默认 1MB，论文 5MB+ 越界导致 request.form() 解析空）
 # 注意：Request._get_form() 和 MultiPartParser.__init__ 各有独立的默认值，两处都要改。
@@ -202,16 +215,25 @@ def _load_marker_config(override_path: str | None = None) -> dict:
 # ============ 启动 / 关闭 ============
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("[启动] 正在校验 Marker 2.0、远程 Surya/vLLM 与本地 OCR Error 服务。")
-    version = validate_marker_version(RUNTIME_CONFIG)
-    remote = await asyncio.to_thread(check_remote_inference, RUNTIME_CONFIG)
-    await asyncio.to_thread(prewarm_local_ocr_error, RUNTIME_CONFIG)
-    local_ocr = await asyncio.to_thread(check_local_ocr_error, RUNTIME_CONFIG)
-    await asyncio.to_thread(init_database)
-    await asyncio.to_thread(cleanup_expired)
-    print(
-        f"[启动] Marker {version}；远程模型 {len(remote.get('models', []))} 个；"
-        f"OCR Error={local_ocr.get('status', 'ok')}；最大 PDF 并发=3。"
+    configure_main_logging(RUNTIME_CONFIG)
+    logger.info("服务启动检查开始")
+    try:
+        version = validate_marker_version(RUNTIME_CONFIG)
+        remote = await asyncio.to_thread(check_remote_inference, RUNTIME_CONFIG)
+        await asyncio.to_thread(prewarm_local_ocr_error, RUNTIME_CONFIG)
+        local_ocr = await asyncio.to_thread(check_local_ocr_error, RUNTIME_CONFIG)
+        await asyncio.to_thread(init_database)
+        await asyncio.to_thread(cleanup_expired)
+    except Exception:
+        logger.exception("服务启动检查失败")
+        shutdown_logging()
+        raise
+    logger.info(
+        "服务启动检查完成 marker_version=%s remote_models=%d ocr_status=%s max_pdf_concurrency=%s",
+        version,
+        len(remote.get("models", [])),
+        local_ocr.get("status", "ok"),
+        RUNTIME_CONFIG.conversion.get("max_concurrent_pdfs", 3),
     )
 
     stop_cleanup = asyncio.Event()
@@ -241,10 +263,69 @@ async def lifespan(app: FastAPI):
                     try:
                         process.terminate()
                     except Exception:
-                        pass
+                        logger.exception("关闭服务时终止 worker 失败")
+                if process is not None:
+                    try:
+                        await asyncio.to_thread(process.join, 2)
+                    except Exception:
+                        logger.exception("关闭服务时回收 worker 失败")
+        logger.info("服务关闭")
+        shutdown_logging()
 
 
 app = FastAPI(title="论文.pdf转换与信息提取", lifespan=lifespan)
+
+
+def _request_id(value: str | None) -> str:
+    """Accept only log-safe client IDs; otherwise generate a fresh UUID."""
+    value = str(value or "").strip()
+    if value and re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", value):
+        return value
+    return uuid.uuid4().hex
+
+
+@app.middleware("http")
+async def request_logging_middleware(request: Request, call_next):
+    request_id = _request_id(request.headers.get("x-request-id"))
+    request.state.request_id = request_id
+    token = bind_log_context(request_id=request_id)
+    started = time.perf_counter()
+    client = request.client.host if request.client else "-"
+    content_length = request.headers.get("content-length", "-")
+    try:
+        response = await call_next(request)
+    except Exception:
+        duration_ms = (time.perf_counter() - started) * 1000
+        logger.exception(
+            "request failed method=%s path=%s duration_ms=%.1f client=%s content_length=%s",
+            request.method, request.url.path,
+            duration_ms,
+            client, content_length,
+        )
+        # Starlette's ServerErrorMiddleware sits outside user middleware, so
+        # re-raising would lose the correlation header. Return the same 500
+        # status with a safe body and request ID instead of exposing a trace.
+        response = JSONResponse(
+            {"detail": "内部服务器错误", "request_id": request_id},
+            status_code=500,
+            headers={"X-Request-ID": request_id},
+        )
+        access_logger.error(
+            "request complete method=%s path=%s status=500 duration_ms=%.1f client=%s content_length=%s",
+            request.method, request.url.path, duration_ms, client, content_length,
+        )
+        return response
+    else:
+        response.headers["X-Request-ID"] = request_id
+        access_logger.info(
+            "request complete method=%s path=%s status=%s duration_ms=%.1f client=%s content_length=%s",
+            request.method, request.url.path, response.status_code,
+            (time.perf_counter() - started) * 1000,
+            client, content_length,
+        )
+        return response
+    finally:
+        reset_log_context(token)
 
 # 前端资源：模板与静态文件（路径基于本文件所在目录，避免依赖启动 cwd）
 BASE_DIR = Path(__file__).parent
@@ -392,7 +473,7 @@ def _convert(
         except Exception:
             # Image repair is supplementary. A missing Poppler/runtime must
             # never prevent the original Marker text from being returned.
-            pass
+            logger.exception("Marker 图像修复失败 format=%s", output_format)
     return text, ext
 
 
@@ -506,6 +587,7 @@ MIME_BY_EXT = {"md": "text/markdown", "json": "application/json", "html": "text/
 
 @app.post("/convert")
 async def convert(
+    request: Request,
     files: List[UploadFile] = File(..., description="PDF 文件，可多选"),
     output_format: List[str] = Form(["markdown"]),
     use_llm: bool = Form(False),
@@ -555,7 +637,8 @@ async def convert(
     slots = _get_conversion_slots()
     proc = ctx.Process(
         target=_convert_task_worker,
-        args=(items, fmts, use_llm, table_mode, gk, ok, marker_config, q, slots),
+        args=(items, fmts, use_llm, table_mode, gk, ok, marker_config, q, slots,
+              get_log_queue(), getattr(request.state, "request_id", ""), ""),
         daemon=True,
     )
     proc.start()
@@ -642,9 +725,16 @@ def _cleanup_convert_task_files(task: dict):
 
 
 # ============ 转换 worker（子进程入口）============
-def _convert_task_worker(items, fmts, use_llm, table_mode, gk, ok, marker_config, q, conversion_slots):
+def _convert_task_worker(
+    items, fmts, use_llm, table_mode, gk, ok, marker_config, q,
+    conversion_slots, log_queue=None, request_id="", task_id="",
+):
     """子进程入口：加载模型并串行转换全部文件；每文件/格式结果与进度经 q 回传主进程。
     主进程可随时 terminate 本进程实现立即取消（当前正在转的文件会丢弃）。"""
+    configure_worker_logging(log_queue)
+    worker_token = bind_log_context(request_id=request_id, task_id=task_id)
+    worker_logger = logging.getLogger("paper.worker.convert")
+    worker_logger.info("转换 worker 启动 files=%d formats=%s", len(items), ",".join(fmts))
     state = {"p": 0.0, "cap": 0.0}
     stop_evt = threading.Event()
 
@@ -673,6 +763,10 @@ def _convert_task_worker(items, fmts, use_llm, table_mode, gk, ok, marker_config
                     try:
                         text, ext = _convert(path, fmt, use_llm, table_mode, gk, ok, marker_config)
                     except Exception as e:  # 单个格式失败不影响其它
+                        worker_logger.exception(
+                            "单个格式转换失败 source=%s format=%s",
+                            Path(orig_name).name, fmt,
+                        )
                         text, ext = f"[转换失败] {orig_name} ({fmt}): {e}", "md"
                         any_failed = True
                     unit += 1
@@ -687,6 +781,7 @@ def _convert_task_worker(items, fmts, use_llm, table_mode, gk, ok, marker_config
                     }))
             q.put(("done", {"success": not any_failed}))
     except Exception as e:
+        worker_logger.exception("转换 worker 异常退出")
         try:
             q.put(("error", str(e)))
         except Exception:
@@ -697,6 +792,7 @@ def _convert_task_worker(items, fmts, use_llm, table_mode, gk, ok, marker_config
             t.join(timeout=1)
         except Exception:
             pass
+        reset_log_context(worker_token)
 
 
 async def _consume_convert_task(task_id: str):
@@ -715,6 +811,10 @@ async def _consume_convert_task(task_id: str):
                     break   # 子进程已死（正常结束或被强杀），队列已清空
                 continue
             except (EOFError, OSError, ValueError):
+                logger.warning(
+                    "转换 worker 队列异常或已关闭",
+                    extra={"task_id": task_id}, exc_info=True,
+                )
                 break
             kind = msg[0]
             if kind == "stage":
@@ -754,6 +854,11 @@ async def _consume_convert_task(task_id: str):
             task["error"] = task.get("error") or "转换进程意外退出"
             task["stage"] = "失败"
             task["done"] = True
+            logger.error(
+                "转换 worker 意外退出 exitcode=%s",
+                proc.exitcode if proc is not None else None,
+                extra={"task_id": task_id},
+            )
         # 无论正常/取消/异常，临时上传文件统一由主进程清理（子进程被强杀时其 finally 不执行）
         _cleanup_convert_task_files(task)
         try:
@@ -809,7 +914,8 @@ async def convert_async(
     slots = _get_conversion_slots()
     proc = ctx.Process(
         target=_convert_task_worker,
-        args=(items, fmts, use_llm, table_mode, gk, ok, marker_config, q, slots),
+        args=(items, fmts, use_llm, table_mode, gk, ok, marker_config, q, slots,
+              get_log_queue(), "", task_id),
         daemon=True,
     )
     TASKS[task_id] = {
@@ -887,8 +993,16 @@ def _conversion_document_worker(
     marker_options: dict,
     q,
     conversion_slots,
+    log_queue=None,
+    request_id="",
 ):
     """One PDF per process. Large outputs are written to staging, never to Queue."""
+    configure_worker_logging(log_queue)
+    worker_token = bind_log_context(
+        request_id=request_id, task_id=task_id, document_id=document_id,
+    )
+    worker_logger = logging.getLogger("paper.worker.conversion_document")
+    worker_logger.info("文档转换 worker 启动")
     try:
         q.put(("queued", "等待转换槽位"))
         with conversion_slots:
@@ -914,10 +1028,13 @@ def _conversion_document_worker(
             }))
             q.put(("done", True))
     except Exception as exc:
+        worker_logger.exception("文档转换 worker 异常退出")
         try:
             q.put(("error", str(exc)))
         except Exception:
             pass
+    finally:
+        reset_log_context(worker_token)
 
 
 def _active_conversion_document_count() -> int:
@@ -955,12 +1072,19 @@ async def _run_conversion_document(task_id: str, item: dict):
             task.get("marker_options") or {},
             q,
             _get_conversion_slots(),
+            get_log_queue(),
+            task.get("request_id", ""),
         ),
         daemon=True,
     )
     task.setdefault("processes", {})[item["document_id"]] = process
     task.setdefault("queues", {})[item["document_id"]] = q
     try:
+        logger.info(
+            "文档转换子进程启动",
+            extra={"request_id": task.get("request_id", ""), "task_id": task_id,
+                   "document_id": item.get("document_id", "")},
+        )
         await asyncio.to_thread(process.start)
         while True:
             if task.get("cancel"):
@@ -972,6 +1096,12 @@ async def _run_conversion_document(task_id: str, item: dict):
                     break
                 continue
             except (EOFError, OSError, ValueError):
+                logger.warning(
+                    "文档转换 worker 队列异常或已关闭",
+                    extra={"request_id": task.get("request_id", ""), "task_id": task_id,
+                           "document_id": item.get("document_id", "")},
+                    exc_info=True,
+                )
                 break
             kind = message[0]
             if kind == "queued":
@@ -987,11 +1117,21 @@ async def _run_conversion_document(task_id: str, item: dict):
                 item["status"] = "completed"
                 item["stage"] = "完成"
                 item["percent"] = 100.0
+                logger.info(
+                    "文档转换完成",
+                    extra={"request_id": task.get("request_id", ""), "task_id": task_id,
+                           "document_id": item.get("document_id", "")},
+                )
                 return
             elif kind == "error":
                 item["status"] = "failed"
                 item["stage"] = "失败"
                 item["error"] = message[1]
+                logger.error(
+                    "文档转换失败 error=%s", str(message[1])[:300],
+                    extra={"request_id": task.get("request_id", ""), "task_id": task_id,
+                           "document_id": item.get("document_id", "")},
+                )
                 return
     finally:
         if task.get("cancel") and process.is_alive():
@@ -1008,6 +1148,12 @@ async def _run_conversion_document(task_id: str, item: dict):
                 item["status"] = "failed"
                 item["stage"] = "失败"
                 item["error"] = item.get("error") or "转换子进程意外退出"
+                logger.error(
+                    "文档转换 worker 意外退出 exitcode=%s",
+                    process.exitcode,
+                    extra={"request_id": task.get("request_id", ""), "task_id": task_id,
+                           "document_id": item.get("document_id", "")},
+                )
         Path(item["upload_path"]).unlink(missing_ok=True)
         try:
             q.close()
@@ -1028,6 +1174,10 @@ async def _run_conversion_batch(task_id: str):
             task["stage"] = "已取消"
             task["success"] = False
             task["cancelled"] = True
+            logger.info(
+                "转换批次已取消",
+                extra={"request_id": task.get("request_id", ""), "task_id": task_id},
+            )
         else:
             completed = [item for item in task["files"] if item["status"] == "completed"]
             failed = [item for item in task["files"] if item["status"] == "failed"]
@@ -1038,7 +1188,16 @@ async def _run_conversion_batch(task_id: str):
                 task["download_url"] = f"/api/conversion/download/{task_id}"
             task["success"] = bool(completed) and not failed
             task["stage"] = "完成" if task["success"] else ("部分失败" if completed else "失败")
+            logger.info(
+                "转换批次完成 success=%s completed=%d failed=%d",
+                task["success"], len(completed), len(failed),
+                extra={"request_id": task.get("request_id", ""), "task_id": task_id},
+            )
     except Exception as exc:
+        logger.exception(
+            "转换批次失败",
+            extra={"request_id": task.get("request_id", ""), "task_id": task_id},
+        )
         task["error"] = str(exc)
         task["stage"] = "失败"
         task["success"] = False
@@ -1052,6 +1211,7 @@ async def _run_conversion_batch(task_id: str):
 
 @app.post("/api/conversion/batch")
 async def conversion_batch(
+    request: Request,
     files: List[UploadFile] = File(..., description="PDF 文件，可多选"),
 ):
     max_files = int(RUNTIME_CONFIG.conversion.get("max_files_per_batch", 50))
@@ -1084,12 +1244,17 @@ async def conversion_batch(
                 "error": "",
             })
     except Exception:
+        logger.exception(
+            "保存转换上传文件失败",
+            extra={"request_id": getattr(request.state, "request_id", "")},
+        )
         for item in task_files:
             Path(item["upload_path"]).unlink(missing_ok=True)
         raise
 
     TASKS[task_id] = {
         "created": time.time(),
+        "request_id": getattr(request.state, "request_id", ""),
         "files": task_files,
         "marker_options": _load_marker_config(),
         "processes": {},
@@ -1103,6 +1268,11 @@ async def conversion_batch(
         "error": "",
         "download_url": "",
     }
+    logger.info(
+        "提交转换批次 files=%d",
+        len(task_files),
+        extra={"request_id": getattr(request.state, "request_id", ""), "task_id": task_id},
+    )
     asyncio.create_task(_run_conversion_batch(task_id))
     return JSONResponse({
         "task_id": task_id,
@@ -1148,6 +1318,10 @@ async def conversion_stop(task_id: str):
         return JSONResponse({"error": "任务不存在或已过期"}, status_code=404)
     task["cancel"] = True
     task["stage"] = "正在取消"
+    logger.info(
+        "请求取消转换批次",
+        extra={"request_id": task.get("request_id", ""), "task_id": task_id},
+    )
     for process in list((task.get("processes") or {}).values()):
         if process.is_alive():
             process.terminate()
@@ -1163,6 +1337,11 @@ async def conversion_stop_one(task_id: str, document_id: str):
     if item is None:
         return JSONResponse({"error": "PDF 子任务不存在"}, status_code=404)
     process = (task.get("processes") or {}).get(document_id)
+    logger.info(
+        "请求取消单篇转换",
+        extra={"request_id": task.get("request_id", ""), "task_id": task_id,
+               "document_id": document_id},
+    )
     if process is not None and process.is_alive():
         process.terminate()
     item["status"] = "cancelled"
@@ -1241,7 +1420,8 @@ async def convert_md(
     slots = _get_conversion_slots()
     proc = ctx.Process(
         target=_convert_task_worker,
-        args=(items, ["markdown"], False, False, None, None, cfg_path, q, slots),
+        args=(items, ["markdown"], False, False, None, None, cfg_path, q, slots,
+              get_log_queue(), "", ""),
         daemon=True,
     )
     proc.start()
@@ -1255,6 +1435,11 @@ async def convert_md(
                     break
                 continue
             except (EOFError, OSError, ValueError):
+                logger.warning(
+                    "同步转换 worker 队列异常或已关闭",
+                    extra={},
+                    exc_info=True,
+                )
                 break
             kind = msg[0]
             if kind == "result":
@@ -1425,6 +1610,55 @@ def _node_json_ref(node) -> str:
     return ""
 
 
+def _json_ref_candidates(value, page=None) -> list[str]:
+    """Return ordered aliases for Marker node/content-ref identifiers.
+
+    Marker JSON releases have used full paths (``/page/0/figure/2``), typed
+    suffixes (``figure/2``), and bare block ids (``2``).  Resolve the most
+    specific spelling first and only use a page-qualified/bare alias as a
+    fallback so a repeated block id on another page cannot steal a figure.
+    """
+    if isinstance(value, (int, float)):
+        value = str(value)
+    if not isinstance(value, str):
+        return []
+    raw = html_unescape(value).strip().replace("\\", "/")
+    if not raw:
+        return []
+    raw = raw.split("#", 1)[0].split("?", 1)[0].strip()
+    normalized = _normalized_json_ref(raw)
+    if not normalized:
+        return []
+    parts = normalized.strip("/").split("/")
+    candidates = [normalized]
+    if len(parts) >= 2:
+        candidates.append("/" + "/".join(parts[-2:]))
+    if page is not None:
+        # A bare block id in FigureGroup.structure is scoped to its page.
+        candidates.append(_normalized_json_ref(f"/page/{page}/{raw.lstrip('/')}"))
+        if parts:
+            candidates.append(_normalized_json_ref(f"/page/{page}/{parts[-1]}"))
+    if parts:
+        candidates.append("/" + parts[-1])
+    return list(dict.fromkeys(item for item in candidates if item))
+
+
+def _add_json_ref_aliases(target: dict[str, set], values, page=None, item=None) -> None:
+    """Add a node id under all safe aliases used by FigureGroup matching."""
+    for value in values:
+        for alias in _json_ref_candidates(value, page):
+            target.setdefault(alias, set()).add(item)
+
+
+def _resolve_json_ref(alias_map: dict[str, set], value, page=None) -> set:
+    """Resolve one ref, preferring exact/specific aliases over bare ids."""
+    for alias in _json_ref_candidates(value, page):
+        matches = alias_map.get(alias) or set()
+        if len(matches) == 1:
+            return set(matches)
+    return set()
+
+
 def _figure_group_content_refs(value) -> list[str]:
     """Read structured FigureGroup content-ref values without text-order inference."""
     parser = _ContentRefParser()
@@ -1465,7 +1699,7 @@ def _build_figure_index(internal_json: str) -> list[dict]:
     figure_nodes: list[dict] = []
     figure_nodes_by_ref: dict[str, set[int]] = {}
     caption_figures_by_ref: dict[str, set[str]] = {}
-    figure_group_refs: list[list[str]] = []
+    figure_group_refs: list[dict] = []
     labelled_figure_nodes: set[int] = set()
     visit_order = 0
 
@@ -1502,6 +1736,11 @@ def _build_figure_index(internal_json: str) -> list[dict]:
         bbox = node.get("bbox") or node.get("polygon") or node.get("coordinates")
         images = _json_image_data_uris(node.get("images")) if is_visual_node else []
         node_ref = _node_json_ref(node)
+        node_ref_values = [
+            node.get(key)
+            for key in ("id", "ref", "path", "source_ref", "block_id")
+            if node.get(key) is not None
+        ]
         node_index = None
         if is_visual_node and images:
             node_index = len(figure_nodes)
@@ -1511,15 +1750,37 @@ def _build_figure_index(internal_json: str) -> list[dict]:
                 "order": visit_order,
                 "images": images,
             })
-            if node_ref:
-                figure_nodes_by_ref.setdefault(node_ref, set()).add(node_index)
+            _add_json_ref_aliases(
+                figure_nodes_by_ref,
+                node_ref_values,
+                current_page,
+                node_index,
+            )
         if is_figure_group:
             refs = _figure_group_content_refs(text)
             for member in node.get("structure") or []:
                 if isinstance(member, dict) and member.get("block_id") is not None:
-                    refs.append(_normalized_json_ref(member["block_id"]))
+                    block_id = member["block_id"]
+                    refs.append(block_id)
+                    block_type = str(
+                        member.get("block_type")
+                        or member.get("type")
+                        or member.get("block_type_name")
+                        or ""
+                    ).strip()
+                    if block_type:
+                        refs.append(f"{block_type}/{block_id}")
+                    member_page = member.get("page_id", current_page)
+                    if member_page is not None:
+                        block_path = str(block_id).lstrip("/")
+                        typed_id = (
+                            block_path
+                            if "/" in block_path or not block_type
+                            else f"{block_type}/{block_path}"
+                        )
+                        refs.append(f"/page/{member_page}/{typed_id.lstrip('/')}")
             if refs:
-                figure_group_refs.append(refs)
+                figure_group_refs.append({"refs": refs, "page": current_page})
         if fig_id and (is_caption_node or is_visual_node or node.get("caption") is not None):
             entry = figures.setdefault(fig_id, {
                 "id": fig_id,
@@ -1544,8 +1805,13 @@ def _build_figure_index(internal_json: str) -> list[dict]:
                 entry["images"] = images
                 if node_index is not None:
                     labelled_figure_nodes.add(node_index)
-            if is_caption_node and node_ref:
-                caption_figures_by_ref.setdefault(node_ref, set()).add(fig_id)
+            if is_caption_node:
+                _add_json_ref_aliases(
+                    caption_figures_by_ref,
+                    node_ref_values,
+                    current_page,
+                    fig_id,
+                )
         visit_order += 1
         for child in node.values():
             if isinstance(child, (dict, list)):
@@ -1556,19 +1822,17 @@ def _build_figure_index(internal_json: str) -> list[dict]:
     # A FigureGroup records Marker JSON's explicit Figure/Caption membership. Use
     # only unambiguous one-to-one groups before considering geometric fallback.
     direct_pairs: set[tuple[str, int]] = set()
-    for refs in figure_group_refs:
+    for group in figure_group_refs:
         caption_ids: set[str] = set()
         visual_node_indexes: set[int] = set()
-        for ref in refs:
-            ref_type = _ref_block_type(ref)
-            if ref in caption_figures_by_ref:
-                caption_ids.update(caption_figures_by_ref.get(ref, set()))
-            elif ref in figure_nodes_by_ref:
-                visual_node_indexes.update(figure_nodes_by_ref.get(ref, set()))
-            elif ref_type == "caption":
-                caption_ids.update(caption_figures_by_ref.get(ref, set()))
-            elif ref_type in {"figure", "picture", "chart", "image", "visual"}:
-                visual_node_indexes.update(figure_nodes_by_ref.get(ref, set()))
+        group_page = group.get("page")
+        for ref in group.get("refs") or []:
+            caption_ids.update(
+                _resolve_json_ref(caption_figures_by_ref, ref, group_page)
+            )
+            visual_node_indexes.update(
+                _resolve_json_ref(figure_nodes_by_ref, ref, group_page)
+            )
         if len(caption_ids) == 1 and len(visual_node_indexes) == 1:
             direct_pairs.add((next(iter(caption_ids)), next(iter(visual_node_indexes))))
 
@@ -1671,8 +1935,16 @@ def _paper_prepare_worker(
     marker_options,
     q,
     conversion_slots,
+    log_queue=None,
+    request_id="",
 ):
     """一次构建 Document，落盘 Markdown/JSON/图片索引，仅回传紧凑结果。"""
+    configure_worker_logging(log_queue)
+    worker_token = bind_log_context(
+        request_id=request_id, task_id=task_id, document_id=document_id,
+    )
+    worker_logger = logging.getLogger("paper.worker.paper_prepare")
+    worker_logger.info("论文预处理 worker 启动")
     try:
         with conversion_slots:
             def report(stage: str, percent: float) -> None:
@@ -1757,10 +2029,13 @@ def _paper_prepare_worker(
             q.put(("percent", 100.0))
             q.put(("done", {"success": True}))
     except Exception as e:
+        worker_logger.exception("论文预处理 worker 异常退出")
         try:
             q.put(("error", str(e)))
         except Exception:
             pass
+    finally:
+        reset_log_context(worker_token)
 
 
 async def _prepare_one_paper_sync(pdf_path, source_name, markdown, marker_config):
@@ -1774,6 +2049,7 @@ async def _prepare_one_paper_sync(pdf_path, source_name, markdown, marker_config
         args=(
             pdf_path, source_name, task_id, document_id, str(doc_dir_path),
             _load_marker_config(marker_config), q, _get_conversion_slots(),
+            get_log_queue(), "",
         ),
         daemon=True,
     )
@@ -1788,6 +2064,11 @@ async def _prepare_one_paper_sync(pdf_path, source_name, markdown, marker_config
                     break
                 continue
             except (EOFError, OSError, ValueError):
+                logger.warning(
+                    "同步论文预处理 worker 队列异常或已关闭",
+                    extra={"task_id": task_id, "document_id": document_id},
+                    exc_info=True,
+                )
                 break
             if msg[0] == "result":
                 result = msg[1]
@@ -1807,6 +2088,11 @@ async def _prepare_one_paper_sync(pdf_path, source_name, markdown, marker_config
             pass
     if not result and not error:
         error = "论文预处理进程意外退出"
+        logger.error(
+            "同步论文预处理 worker 意外退出 exitcode=%s",
+            proc.exitcode,
+            extra={"task_id": task_id, "document_id": document_id},
+        )
     return result, error
 
 
@@ -1832,6 +2118,12 @@ async def _consume_paper_prep_task(task_id: str):
                     break
                 continue
             except (EOFError, OSError, ValueError):
+                logger.warning(
+                    "论文预处理 worker 队列异常或已关闭",
+                    extra={"request_id": task.get("request_id", ""),
+                           "task_id": task_id, "document_id": task.get("document_id", "")},
+                    exc_info=True,
+                )
                 break
             kind = msg[0]
             if kind == "stage":
@@ -1845,11 +2137,21 @@ async def _consume_paper_prep_task(task_id: str):
                 task["percent"] = 100.0
                 task["stage"] = "完成"
                 task["done"] = True
+                logger.info(
+                    "论文预处理任务完成 success=%s", task["success"],
+                    extra={"request_id": task.get("request_id", ""),
+                           "task_id": task_id, "document_id": task.get("document_id", "")},
+                )
                 return
             elif kind == "error":
                 task["error"] = msg[1]
                 task["stage"] = "失败"
                 task["done"] = True
+                logger.error(
+                    "论文预处理任务失败 error=%s", str(msg[1])[:300],
+                    extra={"request_id": task.get("request_id", ""),
+                           "task_id": task_id, "document_id": task.get("document_id", "")},
+                )
                 return
     finally:
         if proc is not None:
@@ -1865,6 +2167,12 @@ async def _consume_paper_prep_task(task_id: str):
             task["error"] = task.get("error") or "论文预处理进程意外退出"
             task["stage"] = "失败"
             task["done"] = True
+            logger.error(
+                "论文预处理 worker 意外退出 exitcode=%s",
+                proc.exitcode if proc is not None else None,
+                extra={"request_id": task.get("request_id", ""),
+                       "task_id": task_id, "document_id": task.get("document_id", "")},
+            )
         try:
             os.remove(task["_pdf_path"])
         except OSError:
@@ -1877,6 +2185,7 @@ async def _consume_paper_prep_task(task_id: str):
 
 @app.post("/api/prepare_paper")
 async def prepare_paper(
+    request: Request,
     file: UploadFile = File(..., description="需要加入材料提取工作区的原始 PDF"),
     markdown: str = Form(""),
     markdown_file: UploadFile | None = File(
@@ -1905,6 +2214,7 @@ async def prepare_paper(
         args=(
             str(source_pdf), file.filename, task_id, document_id, str(doc_dir_path),
             _load_marker_config(marker_config or None), q, _get_conversion_slots(),
+            get_log_queue(), getattr(request.state, "request_id", ""),
         ),
         daemon=True,
     )
@@ -1912,8 +2222,28 @@ async def prepare_paper(
         "created": time.time(), "percent": 0.0, "stage": "排队中", "done": False,
         "success": False, "error": "", "result": {}, "proc": proc, "q": q,
         "document_id": document_id, "_pdf_path": str(source_pdf),
+        "request_id": getattr(request.state, "request_id", ""),
     }
-    proc.start()
+    logger.info(
+        "提交论文预处理任务",
+        extra={"request_id": getattr(request.state, "request_id", ""),
+               "task_id": task_id, "document_id": document_id},
+    )
+    try:
+        await asyncio.to_thread(proc.start)
+    except Exception as exc:
+        logger.exception(
+            "论文预处理进程启动失败",
+            extra={"request_id": getattr(request.state, "request_id", ""),
+                   "task_id": task_id, "document_id": document_id},
+        )
+        PAPER_PREP_TASKS.pop(task_id, None)
+        Path(source_pdf).unlink(missing_ok=True)
+        try:
+            q.close()
+        except Exception:
+            pass
+        return JSONResponse({"error": f"提取进程启动失败：{exc}"}, status_code=500)
     asyncio.create_task(_consume_paper_prep_task(task_id))
     return JSONResponse({"task_id": task_id, "document_id": document_id})
 
@@ -1941,6 +2271,11 @@ async def stop_paper_prepare(task_id: str):
         return JSONResponse({"ok": True, "already_done": True})
     task["cancel"] = True
     task["stage"] = "正在取消…"
+    logger.info(
+        "请求取消论文预处理",
+        extra={"request_id": task.get("request_id", ""), "task_id": task_id,
+               "document_id": task.get("document_id", "")},
+    )
     proc = task.get("proc")
     if proc is not None and proc.is_alive():
         proc.terminate()
@@ -2206,8 +2541,18 @@ def _merge_result(papers, part1_sections, part2_sections, part3_sections) -> dic
 
 
 def _material_task_worker(contents, names, document_ids, figure_indexes, selected_parts,
-                          verify, provider, run_id, q):
+                          verify, provider, run_id, q, log_queue=None,
+                          request_id="", task_id=""):
     """子进程入口：按文件和用户选择的模块执行，逐模块回传结构化状态。"""
+    configure_worker_logging(log_queue)
+    worker_token = bind_log_context(
+        request_id=request_id, task_id=task_id, provider=provider or "",
+    )
+    worker_logger = logging.getLogger("paper.worker.material")
+    worker_logger.info(
+        "材料提取 worker 启动 documents=%d parts=%s",
+        len(contents), ",".join(selected_parts),
+    )
     state = {"p": 0.0, "cap": 0.0}
     stop_evt = threading.Event()
 
@@ -2228,6 +2573,7 @@ def _material_task_worker(contents, names, document_ids, figure_indexes, selecte
             verify, provider, run_id, q, state,
         ))
     except Exception as e:
+        worker_logger.exception("材料提取 worker 异常退出")
         try:
             q.put(("error", str(e)))
         except Exception:
@@ -2238,11 +2584,13 @@ def _material_task_worker(contents, names, document_ids, figure_indexes, selecte
             t.join(timeout=1)
         except Exception:
             pass
+        reset_log_context(worker_token)
 
 
 async def _material_worker_async(contents, names, document_ids, figure_indexes, selected_parts,
                                  verify, provider, run_id, q, state):
     """逐篇执行用户选择的 part1/part2/part3，并独立记录模块状态、模型和耗时。"""
+    worker_logger = logging.getLogger("paper.worker.material")
     cfg = get_model_config(provider)
     eff_provider = cfg["provider"]
     model_label = cfg.get("label", eff_provider)
@@ -2298,6 +2646,10 @@ async def _material_worker_async(contents, names, document_ids, figure_indexes, 
             state["p"] = seg_start + unit_width * completed_units
             q.put(("percent", state["p"]))
         except Exception as exc:
+            worker_logger.exception(
+                "材料提取预处理失败 document_id=%s", document_id,
+                extra={"document_id": document_id},
+            )
             generated = time.strftime("%Y-%m-%d %H:%M:%S")
             for part in selected_parts:
                 _set_material_part(
@@ -2332,6 +2684,10 @@ async def _material_worker_async(contents, names, document_ids, figure_indexes, 
                     elapsed=elapsed, generated_at=generated, run_id=run_id,
                 )
             except Exception as exc:
+                worker_logger.exception(
+                    "材料提取 part1 失败 document_id=%s", document_id,
+                    extra={"document_id": document_id, "part": "part1", "provider": provider or ""},
+                )
                 _set_material_part(
                     paper, "part1", status="failed", error=str(exc),
                     provider=eff_provider, model_label=model_label,
@@ -2348,6 +2704,11 @@ async def _material_worker_async(contents, names, document_ids, figure_indexes, 
             try:
                 image_summary = await vision_task if vision_task else ""
             except Exception:
+                worker_logger.exception(
+                    "视觉分析任务失败 document_id=%s",
+                    document_id,
+                    extra={"document_id": document_id, "provider": provider or ""},
+                )
                 image_summary = ""
         image_summary = image_summary or ""
         # 图片与报告正文解耦：正文只保留图号，浏览器/VLM 通过 FigureIndex 取图。
@@ -2389,6 +2750,11 @@ async def _material_worker_async(contents, names, document_ids, figure_indexes, 
                 )
                 paper["merged"] = merged
             except Exception:
+                worker_logger.exception(
+                    "材料提取 part2+part3 合并调用失败 document_id=%s",
+                    document_id,
+                    extra={"document_id": document_id, "part": "part2+part3", "provider": provider or ""},
+                )
                 # 合并调用失败时分别重试两个模块，保证其中一个失败不会拖累另一个。
                 p2_start = time.time()
                 try:
@@ -2404,6 +2770,10 @@ async def _material_worker_async(contents, names, document_ids, figure_indexes, 
                         generated_at=time.strftime("%Y-%m-%d %H:%M:%S"), run_id=run_id,
                     )
                 except Exception as exc:
+                    worker_logger.exception(
+                        "材料提取 part2 回退调用失败 document_id=%s", document_id,
+                        extra={"document_id": document_id, "part": "part2", "provider": provider or ""},
+                    )
                     _set_material_part(
                         paper, "part2", status="failed", error=str(exc),
                         provider=eff_provider, model_label=model_label,
@@ -2422,6 +2792,10 @@ async def _material_worker_async(contents, names, document_ids, figure_indexes, 
                         generated_at=time.strftime("%Y-%m-%d %H:%M:%S"), run_id=run_id,
                     )
                 except Exception as exc:
+                    worker_logger.exception(
+                        "材料提取 part3 回退调用失败 document_id=%s", document_id,
+                        extra={"document_id": document_id, "part": "part3", "provider": provider or ""},
+                    )
                     _set_material_part(
                         paper, "part3", status="failed", error=str(exc),
                         provider=eff_provider, model_label=model_label,
@@ -2455,6 +2829,10 @@ async def _material_worker_async(contents, names, document_ids, figure_indexes, 
                         generated_at=time.strftime("%Y-%m-%d %H:%M:%S"), run_id=run_id,
                     )
                 except Exception as exc:
+                    worker_logger.exception(
+                        "材料提取 part2 失败 document_id=%s", document_id,
+                        extra={"document_id": document_id, "part": "part2", "provider": provider or ""},
+                    )
                     _set_material_part(
                         paper, "part2", status="failed", error=str(exc),
                         provider=eff_provider, model_label=model_label,
@@ -2486,6 +2864,10 @@ async def _material_worker_async(contents, names, document_ids, figure_indexes, 
                         generated_at=time.strftime("%Y-%m-%d %H:%M:%S"), run_id=run_id,
                     )
                 except Exception as exc:
+                    worker_logger.exception(
+                        "材料提取 part3 失败 document_id=%s", document_id,
+                        extra={"document_id": document_id, "part": "part3", "provider": provider or ""},
+                    )
                     _set_material_part(
                         paper, "part3", status="failed", error=str(exc),
                         provider=eff_provider, model_label=model_label,
@@ -2558,6 +2940,11 @@ async def _consume_material_task(task_id: str):
                     break
                 continue
             except (EOFError, OSError, ValueError):
+                logger.warning(
+                    "材料提取 worker 队列异常或已关闭",
+                    extra={"request_id": task.get("request_id", ""), "task_id": task_id},
+                    exc_info=True,
+                )
                 break
             kind = msg[0]
             if kind == "stage":
@@ -2578,12 +2965,20 @@ async def _consume_material_task(task_id: str):
                 }.get(status, "完成")
                 task["percent"] = 100.0
                 task["done"] = True
+                logger.info(
+                    "材料提取任务完成 status=%s", task["status"],
+                    extra={"request_id": task.get("request_id", ""), "task_id": task_id},
+                )
                 return
             elif kind == "error":
                 task["error"] = msg[1]
                 task["status"] = "failed"
                 task["stage"] = "失败"
                 task["done"] = True
+                logger.error(
+                    "材料提取任务失败 error=%s", str(msg[1])[:300],
+                    extra={"request_id": task.get("request_id", ""), "task_id": task_id},
+                )
                 return
     finally:
         if proc is not None:
@@ -2617,6 +3012,11 @@ async def _consume_material_task(task_id: str):
             task["stage"] = "失败"
             task["done"] = True
             task["success"] = False
+            logger.error(
+                "材料提取 worker 意外退出 exitcode=%s",
+                proc.exitcode if proc is not None else None,
+                extra={"request_id": task.get("request_id", ""), "task_id": task_id},
+            )
         try:
             q.close()
         except Exception:
@@ -2720,6 +3120,33 @@ async def api_remove_knowledge_report(folder_id: str, report_id: str):
     except KeyError as exc:
         return JSONResponse({"error": str(exc)}, status_code=404)
     return JSONResponse({"ok": True})
+
+
+@app.post("/api/knowledge/folders/{folder_id}/reports/manage")
+async def api_manage_knowledge_reports(folder_id: str, request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "请求体不是合法 JSON"}, status_code=400)
+    body = body or {}
+    report_ids = body.get("report_ids")
+    action = str(body.get("action") or "").strip().lower()
+    target_folder_id = str(body.get("target_folder_id") or "").strip() or None
+    if not isinstance(report_ids, list):
+        return JSONResponse({"error": "report_ids 必须是数组"}, status_code=400)
+    try:
+        result = await asyncio.to_thread(
+            manage_reports_in_folder,
+            folder_id,
+            [str(report_id) for report_id in report_ids],
+            action,
+            target_folder_id,
+        )
+    except KeyError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=404)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    return JSONResponse({"ok": True, **result})
 
 
 @app.get("/api/knowledge/reports/{report_id}")
@@ -2833,6 +3260,7 @@ async def material_extract(request: Request):
         args=(
             contents, names, document_ids, figure_indexes, selected_parts,
             verify, provider, run_id, q,
+            get_log_queue(), getattr(request.state, "request_id", ""), task_id,
         ),
         daemon=True,
     )
@@ -2840,6 +3268,7 @@ async def material_extract(request: Request):
         "created": time.time(),
         "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "run_id": run_id,
+        "request_id": getattr(request.state, "request_id", ""),
         "parts": selected_parts,
         "provider": provider or "",
         "document_ids": document_ids,
@@ -2859,6 +3288,10 @@ async def material_extract(request: Request):
     try:
         await asyncio.to_thread(proc.start)
     except Exception as exc:
+        logger.exception(
+            "材料提取进程启动失败",
+            extra={"request_id": getattr(request.state, "request_id", ""), "task_id": task_id},
+        )
         MATERIAL_TASKS.pop(task_id, None)
         try:
             q.close()
@@ -2907,6 +3340,10 @@ async def stop_material(task_id: str):
         return JSONResponse({"ok": True, "already_done": True})
     task["cancel"] = True
     task["stage"] = "正在取消…"
+    logger.info(
+        "请求取消材料提取",
+        extra={"request_id": task.get("request_id", ""), "task_id": task_id},
+    )
     proc = task.get("proc")
     if proc is not None and proc.is_alive():
         proc.terminate()   # 立即强杀提取子进程
@@ -2933,6 +3370,8 @@ if __name__ == "__main__":
     @click.option("--port", type=int, default=8000, help="监听端口")
     @click.option("--host", type=str, default="127.0.0.1", help="监听地址")
     def main(port: int, host: str):
-        uvicorn.run(app, host=host, port=port)
+        # 请求访问日志由 FastAPI middleware 统一记录，避免与 Uvicorn 默认
+        # access logger 重复；应用错误仍由 uvicorn.error 进入 app.log。
+        uvicorn.run(app, host=host, port=port, access_log=False, log_config=None)
 
     main()

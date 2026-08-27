@@ -311,14 +311,29 @@ def build_export_zip(task_id: str, manifests: Iterable[dict[str, Any]]) -> Path:
     manifests = list(manifests)
     export_path = EXPORT_DIR / f"{safe_name(task_id)}.zip"
     with zipfile.ZipFile(export_path, "w", zipfile.ZIP_DEFLATED) as archive:
-        for manifest in manifests:
+        for index, manifest in enumerate(manifests, start=1):
             doc_dir = document_dir(manifest["document_id"])
-            folder = safe_name(Path(manifest["source_name"]).stem)
-            for name in ("document.md", "marker_meta.json"):
+            # Windows Explorer still applies the legacy MAX_PATH limit when it
+            # extracts a ZIP.  Keep the archive path short even when the source
+            # PDF has a long (or non-ASCII) filename.  The original name remains
+            # available in manifest.json inside the package.
+            source_stem = safe_name(Path(manifest.get("source_name", "")).stem, "document")
+            folder = f"paper-{index:03d}_{source_stem[:48].rstrip(' ._')}"
+            folder = folder.rstrip(" ._") or f"paper-{index:03d}"
+
+            # Keep every generated artifact that exists in staging.  The normal
+            # conversion path has document.md + marker_meta.json; analysis
+            # preparation additionally creates structure/figure index JSON.
+            for name in (
+                "document.md",
+                "marker_meta.json",
+                "structure.json",
+                "figure_index.json",
+                "manifest.json",
+            ):
                 path = doc_dir / name
                 if path.exists():
-                    export_name = f"{folder}/{folder}.md" if name == "document.md" else f"{folder}/{folder}_meta.json"
-                    archive.write(path, export_name)
+                    archive.write(path, f"{folder}/{name}")
             for asset in manifest.get("assets", []):
                 path = doc_dir / asset["relative_path"]
                 if path.exists():

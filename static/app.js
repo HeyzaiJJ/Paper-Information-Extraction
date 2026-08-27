@@ -536,6 +536,7 @@ function createFigurePreviewPanel(figureMap, options = {}) {
   const panel = document.createElement("aside");
   panel.className = "report-figure-panel";
   const hideWhenEmpty = Boolean(options.hideWhenEmpty);
+  let renderToken = 0;
   const head = document.createElement("div");
   head.className = "report-figure-panel-head";
   head.textContent = "图像预览";
@@ -575,10 +576,11 @@ function createFigurePreviewPanel(figureMap, options = {}) {
   };
 
   const show = (keys, reference) => {
+    const token = ++renderToken;
     const figures = (keys || []).map((key) => figureMap[key]).filter(Boolean);
     if (!figures.length) {
       showEmpty("该图号没有可用的 JSON 图片。");
-      return;
+      return false;
     }
     panel.classList.remove("is-empty");
     body.innerHTML = "";
@@ -597,6 +599,10 @@ function createFigurePreviewPanel(figureMap, options = {}) {
       image.alt = figure.label;
       image.title = "双击放大预览";
       image.addEventListener("dblclick", () => openFigureLightbox(figure));
+      image.addEventListener("error", () => {
+        if (token !== renderToken || !panel.isConnected) return;
+        showEmpty(`${figure.label} 图片加载失败，请稍后重试。`);
+      }, { once: true });
       const label = document.createElement("div");
       label.className = "report-figure-label";
       label.textContent = figure.label;
@@ -608,7 +614,10 @@ function createFigurePreviewPanel(figureMap, options = {}) {
       else viewer.appendChild(label);
       const align = () => alignPanelToReference(image, reference);
       image.addEventListener("load", align, { once: true });
-      requestAnimationFrame(align);
+      requestAnimationFrame(() => {
+        if (token !== renderToken || !panel.isConnected || !image.isConnected) return;
+        align();
+      });
     };
     figures.forEach((figure, index) => {
       const tab = document.createElement("button");
@@ -621,10 +630,23 @@ function createFigurePreviewPanel(figureMap, options = {}) {
     });
     if (figures.length > 1) body.appendChild(tabs);
     body.appendChild(viewer);
+    return true;
   };
 
   showEmpty(Object.keys(figureMap).length ? "点击正文中的图号查看图片。" : "该报告没有可用的 JSON 图片。");
-  return { panel, show };
+  return {
+    panel,
+    show,
+    activate() {
+      // A cached report panel can be detached and later reattached when the
+      // user switches papers. Invalidate callbacks from the previous mount.
+      renderToken += 1;
+    },
+    destroy() {
+      renderToken += 1;
+      panel.remove();
+    },
+  };
 }
 
 function prepareReportFigureReferences(container, figureMap, showPreview, isPreviewSelected, registerReference) {
@@ -1600,7 +1622,7 @@ async function loadMatModels() {
     });
   } catch (e) {
     // 接口异常时兜底显示一个默认项，避免下拉框空白
-    matModelSelect.innerHTML = '<option value="mimo-v2.5-pro">Xiaomi MiMo-V2.5-Pro</option>';
+    matModelSelect.innerHTML = '<option value="mimo-v2.5-pro">mimo-v2.5-pro</option>';
   }
 }
 
@@ -1846,8 +1868,7 @@ function resetExtractBtn() {
   matExtractBtn.textContent = "提取";
 }
 
-/* ==================== 知识库：当前页面会话内的手工归档 ==================== */
-// 后续接入数据库时，只需把本段的内存读写方法替换成 API 请求。
+/* ==================== 知识库 ==================== */
 const knowledgeState = {
   folders: [],
   reports: new Map(),
@@ -1855,7 +1876,11 @@ const knowledgeState = {
   expandedFolders: new Set(),
   selectedFolderId: "",
   selectedReportId: "",
-  showAllFolderId: "",
+  managingFolderId: "",
+  manageSelectedReportIds: new Set(),
+  manageBusy: false,
+  manageTargetFolderId: "",
+  manageAction: "move",
   searchTerm: "",
   archiveReportId: "",
   archiveDraft: null,
@@ -1889,6 +1914,15 @@ const knowledgeArchiveConfirmBtn = document.getElementById("knowledge-archive-co
 const knowledgeArchiveSelectionCountEl = document.getElementById("knowledge-archive-selection-count");
 const knowledgeDeleteDialog = document.getElementById("knowledge-delete-dialog");
 const knowledgeDeleteCopyEl = document.getElementById("knowledge-delete-dialog-copy");
+const knowledgeManageDialog = document.getElementById("knowledge-manage-dialog");
+const knowledgeManageForm = document.getElementById("knowledge-manage-form");
+const knowledgeManageCopyEl = document.getElementById("knowledge-manage-dialog-copy");
+const knowledgeManageTargetEl = document.getElementById("knowledge-manage-target");
+const knowledgeManageErrorEl = document.getElementById("knowledge-manage-error");
+const knowledgeManageEmptyEl = document.getElementById("knowledge-manage-empty");
+const knowledgeManageConfirmBtn = document.getElementById("knowledge-manage-confirm");
+const knowledgeReportDeleteDialog = document.getElementById("knowledge-report-delete-dialog");
+const knowledgeReportDeleteCopyEl = document.getElementById("knowledge-report-delete-dialog-copy");
 
 async function loadKnowledgeState(render = false) {
   try {
@@ -2117,6 +2151,79 @@ function closeKnowledgeDeleteDialog() {
   knowledgeState.deletingFolderId = "";
 }
 
+function updateKnowledgeManageDialog() {
+  const targetOptions = knowledgeState.folders.filter((folder) => folder.id !== knowledgeState.managingFolderId);
+  knowledgeManageTargetEl.innerHTML = "";
+  targetOptions.forEach((folder) => {
+    const option = document.createElement("option");
+    option.value = folder.id;
+    option.textContent = folder.name;
+    knowledgeManageTargetEl.appendChild(option);
+  });
+  knowledgeState.manageTargetFolderId = targetOptions[0]?.id || "";
+  knowledgeManageTargetEl.value = knowledgeState.manageTargetFolderId;
+  knowledgeManageEmptyEl.classList.toggle("is-hidden", targetOptions.length > 0);
+  knowledgeManageTargetEl.disabled = !targetOptions.length;
+  knowledgeManageConfirmBtn.disabled = !targetOptions.length;
+  knowledgeManageConfirmBtn.textContent = knowledgeState.manageAction === "copy" ? "确认复制" : "确认移动";
+}
+
+function openKnowledgeManageDialog(folder) {
+  const selectedCount = knowledgeState.manageSelectedReportIds.size;
+  if (!folder || !selectedCount || knowledgeState.manageBusy) return;
+  knowledgeState.manageAction = "move";
+  knowledgeManageCopyEl.textContent = `已选择 ${selectedCount} 篇报告，请选择目标文件夹。`;
+  knowledgeManageErrorEl.textContent = "";
+  knowledgeManageErrorEl.classList.add("is-hidden");
+  const moveRadio = knowledgeManageForm.querySelector('input[value="move"]');
+  if (moveRadio) moveRadio.checked = true;
+  updateKnowledgeManageDialog();
+  if (!knowledgeManageDialog.open) knowledgeManageDialog.showModal();
+}
+
+function closeKnowledgeManageDialog() {
+  closeDialog(knowledgeManageDialog);
+  knowledgeManageErrorEl.textContent = "";
+  knowledgeManageErrorEl.classList.add("is-hidden");
+}
+
+function openKnowledgeReportDeleteDialog(folder) {
+  const selectedCount = knowledgeState.manageSelectedReportIds.size;
+  if (!folder || !selectedCount || knowledgeState.manageBusy) return;
+  knowledgeReportDeleteCopyEl.textContent = `确定永久删除当前选中的 ${selectedCount} 篇报告吗？它们会从所有文件夹移除，对应文章、图片和图表资产也会被永久删除，此操作不可恢复。`;
+  if (!knowledgeReportDeleteDialog.open) knowledgeReportDeleteDialog.showModal();
+}
+
+function closeKnowledgeReportDeleteDialog() {
+  closeDialog(knowledgeReportDeleteDialog);
+}
+
+async function submitKnowledgeManage(action, targetFolderId = null) {
+  const sourceFolderId = knowledgeState.managingFolderId;
+  const reportIds = [...knowledgeState.manageSelectedReportIds];
+  if (!sourceFolderId || !reportIds.length || knowledgeState.manageBusy) return;
+  knowledgeState.manageBusy = true;
+  try {
+    const response = await fetch(`/api/knowledge/folders/${encodeURIComponent(sourceFolderId)}/reports/manage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ report_ids: reportIds, action, target_folder_id: targetFolderId }),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.error || "批量操作失败");
+    closeKnowledgeManageDialog();
+    closeKnowledgeReportDeleteDialog();
+    exitKnowledgeManageMode(false);
+    await loadKnowledgeState(true);
+  } catch (error) {
+    knowledgeManageErrorEl.textContent = error.message;
+    knowledgeManageErrorEl.classList.remove("is-hidden");
+    alert(error.message);
+  } finally {
+    knowledgeState.manageBusy = false;
+  }
+}
+
 async function removeReportFromKnowledgeFolder(folderId, reportId) {
   const response = await fetch(
     `/api/knowledge/folders/${encodeURIComponent(folderId)}/reports/${encodeURIComponent(reportId)}`,
@@ -2128,6 +2235,23 @@ async function removeReportFromKnowledgeFolder(folderId, reportId) {
     return;
   }
   await loadKnowledgeState(true);
+}
+
+function enterKnowledgeManageMode(folderId) {
+  knowledgeState.selectedFolderId = folderId;
+  knowledgeState.selectedReportId = "";
+  knowledgeState.managingFolderId = folderId;
+  knowledgeState.manageSelectedReportIds = new Set();
+  renderKnowledgeWorkspace();
+}
+
+function exitKnowledgeManageMode(render = true) {
+  knowledgeState.managingFolderId = "";
+  knowledgeState.manageSelectedReportIds = new Set();
+  knowledgeState.manageBusy = false;
+  knowledgeState.manageTargetFolderId = "";
+  knowledgeState.manageAction = "move";
+  if (render) renderKnowledgeWorkspace();
 }
 
 function renderKnowledgeTree() {
@@ -2185,7 +2309,7 @@ function renderKnowledgeTree() {
     folderButton.addEventListener("click", () => {
       knowledgeState.selectedFolderId = folder.id;
       knowledgeState.selectedReportId = "";
-      knowledgeState.showAllFolderId = "";
+      exitKnowledgeManageMode(false);
       renderKnowledgeWorkspace();
     });
 
@@ -2206,10 +2330,7 @@ function renderKnowledgeTree() {
     manage.textContent = "管理论文";
     manage.addEventListener("click", () => {
       menu.open = false;
-      knowledgeState.selectedFolderId = folder.id;
-      knowledgeState.selectedReportId = "";
-      knowledgeState.showAllFolderId = folder.id;
-      renderKnowledgeWorkspace();
+      enterKnowledgeManageMode(folder.id);
     });
     const remove = document.createElement("button");
     remove.type = "button";
@@ -2235,24 +2356,11 @@ function renderKnowledgeTree() {
       reportButton.addEventListener("click", () => {
         knowledgeState.selectedFolderId = folder.id;
         knowledgeState.selectedReportId = report.id;
-        knowledgeState.showAllFolderId = "";
+        exitKnowledgeManageMode(false);
         renderKnowledgeWorkspace();
       });
       reportList.appendChild(reportButton);
     });
-    if (!query && reports.length > 10) {
-      const more = document.createElement("button");
-      more.type = "button";
-      more.className = "knowledge-view-all";
-      more.textContent = `查看全部 ${reports.length} 篇`;
-      more.addEventListener("click", () => {
-        knowledgeState.selectedFolderId = folder.id;
-        knowledgeState.selectedReportId = "";
-        knowledgeState.showAllFolderId = folder.id;
-        renderKnowledgeWorkspace();
-      });
-      reportList.appendChild(more);
-    }
     if (!reports.length) {
       const empty = document.createElement("div");
       empty.className = "knowledge-folder-empty";
@@ -2303,9 +2411,17 @@ function createKnowledgeEmptyState() {
   return empty;
 }
 
-function createKnowledgeReportListItem(folder, report) {
-  const item = document.createElement("button");
-  item.type = "button";
+function toggleKnowledgeManagedReport(reportId) {
+  if (knowledgeState.manageSelectedReportIds.has(reportId)) {
+    knowledgeState.manageSelectedReportIds.delete(reportId);
+  } else {
+    knowledgeState.manageSelectedReportIds.add(reportId);
+  }
+}
+
+function createKnowledgeReportListItem(folder, report, managing = false) {
+  const item = document.createElement(managing ? "div" : "button");
+  if (!managing) item.type = "button";
   item.className = "knowledge-report-list-item";
   const main = document.createElement("span");
   main.className = "knowledge-report-list-main";
@@ -2317,16 +2433,46 @@ function createKnowledgeReportListItem(folder, report) {
   meta.className = "knowledge-report-list-meta";
   meta.textContent = `${report.modelLabel} · ${report.generatedAt || "未记录生成时间"}`;
   main.append(title, meta);
-  const arrow = document.createElement("span");
-  arrow.className = "knowledge-report-list-arrow";
-  arrow.textContent = "›";
-  item.append(main, arrow);
-  item.addEventListener("click", () => {
-    knowledgeState.selectedFolderId = folder.id;
-    knowledgeState.selectedReportId = report.id;
-    knowledgeState.showAllFolderId = "";
-    renderKnowledgeWorkspace();
-  });
+  if (managing) {
+    item.classList.add("is-managing");
+    item.setAttribute("role", "checkbox");
+    item.tabIndex = 0;
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.className = "knowledge-report-select";
+    checkbox.checked = knowledgeState.manageSelectedReportIds.has(report.id);
+    checkbox.setAttribute("aria-label", `选择 ${report.name}`);
+    const update = () => {
+      toggleKnowledgeManagedReport(report.id);
+      item.classList.toggle("is-selected", knowledgeState.manageSelectedReportIds.has(report.id));
+      item.setAttribute("aria-checked", String(knowledgeState.manageSelectedReportIds.has(report.id)));
+      checkbox.checked = knowledgeState.manageSelectedReportIds.has(report.id);
+      item.dispatchEvent(new CustomEvent("knowledge-selection-change", { bubbles: true }));
+    };
+    checkbox.addEventListener("click", (event) => event.stopPropagation());
+    checkbox.addEventListener("change", update);
+    item.append(checkbox, main);
+    item.classList.toggle("is-selected", checkbox.checked);
+    item.setAttribute("aria-checked", String(checkbox.checked));
+    item.addEventListener("click", () => update());
+    item.addEventListener("keydown", (event) => {
+      if (event.key === " " || event.key === "Enter") {
+        event.preventDefault();
+        update();
+      }
+    });
+  } else {
+    const arrow = document.createElement("span");
+    arrow.className = "knowledge-report-list-arrow";
+    arrow.textContent = "›";
+    item.append(main, arrow);
+    item.addEventListener("click", () => {
+      knowledgeState.selectedFolderId = folder.id;
+      knowledgeState.selectedReportId = report.id;
+      exitKnowledgeManageMode(false);
+      renderKnowledgeWorkspace();
+    });
+  }
   return item;
 }
 
@@ -2334,7 +2480,7 @@ function createKnowledgeFolderOverview(folder) {
   const wrapper = document.createElement("div");
   wrapper.className = "knowledge-overview";
   wrapper.appendChild(createKnowledgeBreadcrumb([
-    { label: "知识库", onClick: () => { knowledgeState.selectedFolderId = ""; renderKnowledgeWorkspace(); } },
+    { label: "知识库", onClick: () => { knowledgeState.selectedFolderId = ""; exitKnowledgeManageMode(false); renderKnowledgeWorkspace(); } },
     { label: folder.name, current: true },
   ]));
   const heading = document.createElement("div");
@@ -2349,10 +2495,11 @@ function createKnowledgeFolderOverview(folder) {
   const manage = document.createElement("button");
   manage.type = "button";
   manage.className = "knowledge-manage-btn";
-  manage.textContent = "管理论文";
+  const managing = knowledgeState.managingFolderId === folder.id;
+  manage.textContent = managing ? "退出管理" : "管理论文";
   manage.addEventListener("click", () => {
-    knowledgeState.showAllFolderId = folder.id;
-    renderKnowledgeWorkspace();
+    if (managing) exitKnowledgeManageMode();
+    else enterKnowledgeManageMode(folder.id);
   });
   heading.append(titleWrap, manage);
   wrapper.appendChild(heading);
@@ -2364,42 +2511,38 @@ function createKnowledgeFolderOverview(folder) {
     wrapper.appendChild(empty);
     return wrapper;
   }
-  const sectionTitle = document.createElement("h3");
-  sectionTitle.className = "knowledge-section-heading";
-  sectionTitle.textContent = "最近归档";
-  wrapper.appendChild(sectionTitle);
-  const list = document.createElement("div");
-  list.className = "knowledge-overview-list";
-  folderReportIds(folder.id).slice(0, 5).map(reportById).filter(Boolean).forEach((report) => {
-    list.appendChild(createKnowledgeReportListItem(folder, report));
-  });
-  wrapper.appendChild(list);
-  return wrapper;
-}
-
-function createKnowledgeFolderAllReports(folder) {
-  const wrapper = document.createElement("div");
-  wrapper.className = "knowledge-overview";
-  wrapper.appendChild(createKnowledgeBreadcrumb([
-    { label: "知识库", onClick: () => { knowledgeState.selectedFolderId = ""; knowledgeState.showAllFolderId = ""; renderKnowledgeWorkspace(); } },
-    { label: folder.name, onClick: () => { knowledgeState.showAllFolderId = ""; renderKnowledgeWorkspace(); } },
-    { label: "全部报告", current: true },
-  ]));
-  const heading = document.createElement("div");
-  heading.className = "knowledge-content-heading";
-  const copy = document.createElement("div");
-  const title = document.createElement("h2");
-  title.textContent = `${folder.name} · 全部报告`;
-  const meta = document.createElement("p");
-  meta.textContent = `${folderReportIds(folder.id).length} 篇归档报告`;
-  copy.append(title, meta);
-  heading.appendChild(copy);
-  wrapper.appendChild(heading);
   const filter = document.createElement("input");
   filter.type = "search";
   filter.className = "knowledge-list-search";
   filter.placeholder = "搜索当前文件夹中的论文";
+  filter.setAttribute("aria-label", "搜索当前文件夹中的论文");
   wrapper.appendChild(filter);
+
+  const toolbar = document.createElement("div");
+  toolbar.className = "knowledge-manage-toolbar" + (managing ? " is-visible" : " is-hidden");
+  const selectAllLabel = document.createElement("label");
+  selectAllLabel.className = "knowledge-select-all";
+  const selectAll = document.createElement("input");
+  selectAll.type = "checkbox";
+  selectAllLabel.append(selectAll, document.createTextNode("全选当前列表"));
+  const selectedCount = document.createElement("span");
+  selectedCount.className = "knowledge-manage-count";
+  const move = document.createElement("button");
+  move.type = "button";
+  move.className = "knowledge-dialog-confirm";
+  move.textContent = "移动/复制";
+  const deleteBtn = document.createElement("button");
+  deleteBtn.type = "button";
+  deleteBtn.className = "knowledge-dialog-danger";
+  deleteBtn.textContent = "删除";
+  const cancel = document.createElement("button");
+  cancel.type = "button";
+  cancel.className = "knowledge-manage-cancel";
+  cancel.textContent = "取消管理";
+  cancel.addEventListener("click", () => exitKnowledgeManageMode());
+  toolbar.append(selectAllLabel, selectedCount, move, deleteBtn, cancel);
+  if (managing) wrapper.appendChild(toolbar);
+
   const list = document.createElement("div");
   list.className = "knowledge-overview-list knowledge-full-list";
   const renderList = () => {
@@ -2413,10 +2556,40 @@ function createKnowledgeFolderAllReports(folder) {
       empty.className = "knowledge-inline-empty";
       empty.textContent = "没有匹配的报告。";
       list.appendChild(empty);
+      updateToolbar();
       return;
     }
-    reports.forEach((report) => list.appendChild(createKnowledgeReportListItem(folder, report)));
+    reports.forEach((report) => {
+      const item = createKnowledgeReportListItem(folder, report, managing);
+      item.addEventListener("knowledge-selection-change", updateToolbar);
+      list.appendChild(item);
+    });
+    updateToolbar();
   };
+  const updateToolbar = () => {
+    if (!managing) return;
+    const visibleIds = folderReportIds(folder.id)
+      .map(reportById)
+      .filter((report) => report && (!normalizeKnowledgeName(filter.value).toLocaleLowerCase() || report.name.toLocaleLowerCase().includes(normalizeKnowledgeName(filter.value).toLocaleLowerCase())))
+      .map((report) => report.id);
+    const selected = knowledgeState.manageSelectedReportIds.size;
+    selectedCount.textContent = `已选择 ${selected} 篇`;
+    selectAll.checked = visibleIds.length > 0 && visibleIds.every((id) => knowledgeState.manageSelectedReportIds.has(id));
+    selectAll.indeterminate = visibleIds.some((id) => knowledgeState.manageSelectedReportIds.has(id)) && !selectAll.checked;
+    move.disabled = selected === 0 || knowledgeState.manageBusy;
+    deleteBtn.disabled = selected === 0 || knowledgeState.manageBusy;
+  };
+  selectAll.addEventListener("change", () => {
+    const query = normalizeKnowledgeName(filter.value).toLocaleLowerCase();
+    const visibleReports = folderReportIds(folder.id).map(reportById).filter((report) => report && (!query || report.name.toLocaleLowerCase().includes(query)));
+    visibleReports.forEach((report) => {
+      if (selectAll.checked) knowledgeState.manageSelectedReportIds.add(report.id);
+      else knowledgeState.manageSelectedReportIds.delete(report.id);
+    });
+    renderList();
+  });
+  move.addEventListener("click", () => openKnowledgeManageDialog(folder));
+  deleteBtn.addEventListener("click", () => openKnowledgeReportDeleteDialog(folder));
   filter.addEventListener("input", renderList);
   renderList();
   wrapper.appendChild(list);
@@ -2427,7 +2600,7 @@ function createKnowledgeReportDetail(folder, report) {
   const wrapper = document.createElement("article");
   wrapper.className = "knowledge-report-detail";
   wrapper.appendChild(createKnowledgeBreadcrumb([
-    { label: "知识库", onClick: () => { knowledgeState.selectedFolderId = ""; knowledgeState.selectedReportId = ""; renderKnowledgeWorkspace(); } },
+    { label: "知识库", onClick: () => { knowledgeState.selectedFolderId = ""; knowledgeState.selectedReportId = ""; exitKnowledgeManageMode(false); renderKnowledgeWorkspace(); } },
     { label: folder.name, onClick: () => { knowledgeState.selectedReportId = ""; renderKnowledgeWorkspace(); } },
     { label: report.name, current: true },
   ]));
@@ -2526,8 +2699,6 @@ function renderKnowledgeContent() {
   const report = reportById(knowledgeState.selectedReportId);
   if (report && folderReportIds(folder.id).includes(report.id)) {
     knowledgeContentEl.appendChild(createKnowledgeReportDetail(folder, report));
-  } else if (knowledgeState.showAllFolderId === folder.id) {
-    knowledgeContentEl.appendChild(createKnowledgeFolderAllReports(folder));
   } else {
     knowledgeContentEl.appendChild(createKnowledgeFolderOverview(folder));
   }
@@ -2650,7 +2821,6 @@ knowledgeArchiveForm.addEventListener("submit", async (event) => {
   }
   knowledgeState.selectedFolderId = selectedIds[0] || "";
   knowledgeState.selectedReportId = data.report && data.report.id || "";
-  knowledgeState.showAllFolderId = "";
   closeKnowledgeArchiveDialog();
   await loadKnowledgeState(true);
   renderMatReport(false);
@@ -2682,15 +2852,35 @@ document.getElementById("knowledge-delete-confirm").addEventListener("click", as
   if (knowledgeState.selectedFolderId === folder.id) {
     knowledgeState.selectedFolderId = "";
     knowledgeState.selectedReportId = "";
-    knowledgeState.showAllFolderId = "";
+    exitKnowledgeManageMode(false);
   }
   closeKnowledgeDeleteDialog();
   await loadKnowledgeState(true);
 });
-[knowledgeFolderDialog, knowledgeArchiveDialog, knowledgeDeleteDialog].forEach((dialog) => {
+[knowledgeFolderDialog, knowledgeArchiveDialog, knowledgeDeleteDialog, knowledgeManageDialog, knowledgeReportDeleteDialog].forEach((dialog) => {
   dialog.addEventListener("click", (event) => {
     if (event.target === dialog) closeDialog(dialog);
   });
+});
+document.getElementById("knowledge-manage-cancel").addEventListener("click", closeKnowledgeManageDialog);
+document.getElementById("knowledge-manage-cancel-icon").addEventListener("click", closeKnowledgeManageDialog);
+knowledgeManageTargetEl.addEventListener("change", () => {
+  knowledgeState.manageTargetFolderId = knowledgeManageTargetEl.value;
+});
+knowledgeManageForm.querySelectorAll('input[name="knowledge-manage-action"]').forEach((input) => {
+  input.addEventListener("change", () => {
+    knowledgeState.manageAction = input.value;
+    knowledgeManageConfirmBtn.textContent = input.value === "copy" ? "确认复制" : "确认移动";
+  });
+});
+knowledgeManageForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  await submitKnowledgeManage(knowledgeState.manageAction, knowledgeState.manageTargetFolderId);
+});
+document.getElementById("knowledge-report-delete-cancel").addEventListener("click", closeKnowledgeReportDeleteDialog);
+document.getElementById("knowledge-report-delete-cancel-icon").addEventListener("click", closeKnowledgeReportDeleteDialog);
+document.getElementById("knowledge-report-delete-confirm").addEventListener("click", async () => {
+  await submitKnowledgeManage("delete");
 });
 enableKnowledgeSplitter();
 

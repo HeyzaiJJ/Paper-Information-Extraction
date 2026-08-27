@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 import json
 from pathlib import Path
 import uuid
-from typing import Any
+from typing import Any, Literal
 
 from sqlalchemy import (
     DateTime,
@@ -519,6 +519,72 @@ def remove_report_from_folder(folder_id: str, report_id: str) -> None:
         session.delete(link)
         session.flush()
         _delete_orphan_report(session, report)
+
+
+def manage_reports_in_folder(
+    source_folder_id: str,
+    report_ids: list[str],
+    action: Literal["move", "copy", "delete"],
+    target_folder_id: str | None = None,
+) -> dict[str, Any]:
+    """Apply one atomic bulk operation to reports currently in a folder."""
+    normalized_ids = list(dict.fromkeys(str(report_id).strip() for report_id in report_ids if str(report_id).strip()))
+    if not normalized_ids:
+        raise ValueError("至少选择一篇报告")
+    if action not in {"move", "copy", "delete"}:
+        raise ValueError("不支持的批量操作")
+
+    with SessionLocal.begin() as session:
+        source_folder = session.get(KnowledgeFolder, source_folder_id)
+        if source_folder is None:
+            raise KeyError("源文件夹不存在")
+
+        target_folder = None
+        if action in {"move", "copy"}:
+            if not target_folder_id:
+                raise ValueError("移动或复制时必须选择目标文件夹")
+            if target_folder_id == source_folder_id:
+                raise ValueError("目标文件夹不能与源文件夹相同")
+            target_folder = session.get(KnowledgeFolder, target_folder_id)
+            if target_folder is None:
+                raise KeyError("目标文件夹不存在")
+
+        links = []
+        reports = []
+        for report_id in normalized_ids:
+            link = session.get(KnowledgeFolderReport, {
+                "folder_id": source_folder_id,
+                "report_id": report_id,
+            })
+            if link is None:
+                raise KeyError("有报告不属于当前文件夹")
+            links.append(link)
+            reports.append(link.report)
+
+        if action in {"move", "copy"}:
+            assert target_folder is not None
+            for report in reports:
+                existing = session.get(KnowledgeFolderReport, {
+                    "folder_id": target_folder.id,
+                    "report_id": report.id,
+                })
+                if existing is None:
+                    session.add(KnowledgeFolderReport(folder=target_folder, report=report))
+            session.flush()
+            if action == "move":
+                for link in links:
+                    session.delete(link)
+                session.flush()
+        else:
+            articles = [report.article for report in reports]
+            for report in reports:
+                session.delete(report)
+            session.flush()
+            for article in articles:
+                if article is not None:
+                    session.delete(article)
+
+    return {"action": action, "affectedCount": len(normalized_ids)}
 
 
 def knowledge_asset(asset_id: str) -> tuple[bytes, str, str]:

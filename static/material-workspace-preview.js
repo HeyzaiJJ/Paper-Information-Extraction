@@ -38,9 +38,14 @@
     let activePart = "part2";
     const activeTasks = new Map();
     const launchingTargets = new Set(); // 请求已发出、尚未拿到 task_id 的 documentId::part
+    // Completed report bodies are expensive to recreate: marked, KaTeX and
+    // figure-reference wiring all touch the DOM. Keep one view per paper/part
+    // and reattach it when the user switches articles.
+    const reportViewCache = new Map();
     let startPending = false;
     let lastTaskMessage = "暂无提取任务";
     let lastFileSignature = "";
+    let renderScheduled = false;
 
     const files = () => bridge.getFiles() || [];
     const fileById = (id) => files().find((item) => item.id === id) || null;
@@ -269,6 +274,11 @@
         remove.addEventListener("click", async () => {
           selectedDocuments.delete(file.id);
           selectedPartsByDocument.delete(file.id);
+          ["part1", "part2", "part3"].forEach((part) => {
+            const cached = reportViewCache.get(targetKey(file.id, part));
+            if (cached?.figurePreview?.destroy) cached.figurePreview.destroy();
+            reportViewCache.delete(targetKey(file.id, part));
+          });
           await bridge.removeFile(file.id);
           renderAll();
         });
@@ -348,6 +358,51 @@
       return markdown.replace(new RegExp("^###\\s+" + escaped + "\\s*\\n+"), "");
     }
 
+    function figureMapSignature(figureMap) {
+      return Object.values(figureMap || {})
+        .map((figure) => `${figure.id}|${figure.image}|${figure.caption || ""}`)
+        .sort()
+        .join("\n");
+    }
+
+    function reportBodySignature(documentId, part, effective, figureMap) {
+      if (!effective) return "";
+      const content = String(effective.content || "");
+      return [
+        documentId,
+        part,
+        effective.run_id || "",
+        content,
+        figureMapSignature(figureMap),
+      ].join("\u0000");
+    }
+
+    function cachedReportContent(documentId, part, result, effective) {
+      const figureMap = bridge.figureMapForDocument(documentId) || {};
+      const signature = reportBodySignature(documentId, part, effective, figureMap);
+      const key = targetKey(documentId, part);
+      const cached = reportViewCache.get(key);
+      if (cached && cached.signature === signature) {
+        if (cached.figurePreview?.activate) cached.figurePreview.activate();
+        return cached;
+      }
+      if (cached?.figurePreview?.destroy) cached.figurePreview.destroy();
+
+      const content = document.createElement("div");
+      content.className = "mw-report-content";
+      const body = document.createElement("div");
+      body.className = "mw-report-markdown preview-md";
+      const markdown = part === "part2"
+        ? effective.content
+        : stripLeadingName(effective.content, result.name);
+      const figurePreview = bridge.createFigurePreviewPanel(figureMap, { hideWhenEmpty: true });
+      bridge.renderMarkdownWithFigureReferences(body, markdown, figureMap, figurePreview);
+      content.append(body, figurePreview.panel);
+      const view = { signature, content, figurePreview };
+      reportViewCache.set(key, view);
+      return view;
+    }
+
     function renderDetail() {
       if (!activeDocumentId) { el.detailEmpty.classList.remove("is-hidden"); el.detailContent.classList.add("is-hidden"); return; }
       const file = fileById(activeDocumentId);
@@ -392,15 +447,12 @@
           const action = cancelTaskButton(runningTask);
           if (action) el.report.appendChild(action);
         }
-        const content = document.createElement("div"); content.className = "mw-report-content";
-        const body = document.createElement("div"); body.className = "mw-report-markdown preview-md";
-        const markdown = activePart === "part2" ? effective.content : stripLeadingName(effective.content, result.name);
-        const figureMap = bridge.figureMapForDocument(activeDocumentId);
-        // 沿用报告预览的交互：点击正文图号后，右侧预览图会根据引用位置对齐。
-        // 图片双击放大、图注渲染和导出内容仍由共享预览组件统一处理。
-        const figurePreview = bridge.createFigurePreviewPanel(figureMap, { hideWhenEmpty: true });
-        bridge.renderMarkdownWithFigureReferences(body, markdown, figureMap, figurePreview);
-        content.append(body, figurePreview.panel); el.report.appendChild(content);
+        // Reattach the cached body instead of rerunning marked/KaTeX on every
+        // progress tick. The preview controller keeps its selected figure and
+        // scroll position while another article is being processed.
+        el.report.appendChild(
+          cachedReportContent(activeDocumentId, activePart, result, effective).content,
+        );
       } else if (attempt && ["queued", "running"].includes(attempt.status)) {
         const state = document.createElement("div"); state.className = "mw-report-state";
         state.innerHTML = `<i data-lucide="loader-circle" class="mw-spin" aria-hidden="true"></i><strong>正在提取</strong><span>${escapeHtml(modelLabel(attempt) || "模型处理中")}</span>`;
@@ -465,6 +517,17 @@
     function renderAll() {
       renderFiles(); renderResults(); renderDetail(); refreshStartButton(); refreshHeaderStatus();
       lastFileSignature = fileSignature();
+    }
+
+    function scheduleRender() {
+      if (renderScheduled) return;
+      renderScheduled = true;
+      const flush = () => {
+        renderScheduled = false;
+        renderAll();
+      };
+      if (typeof window.requestAnimationFrame === "function") window.requestAnimationFrame(flush);
+      else window.setTimeout(flush, 16);
     }
 
     async function loadModels() {
@@ -569,7 +632,7 @@
           if (!response.ok) throw new Error(data.error || "提取进度查询失败");
         } catch (error) {
           lastTaskMessage = `进度查询失败：${error.message || error}`;
-          activeTasks.delete(taskId); renderAll(); return;
+          activeTasks.delete(taskId); scheduleRender(); return;
         }
         task.percent = Number(data.percent || 0); task.stage = data.stage || "提取中";
         const runInfo = {
@@ -580,9 +643,9 @@
         ((data.result && data.result.papers) || []).forEach((paper) => mergePaperState(paper, runInfo));
         if (data.done) {
           lastTaskMessage = data.cancelled ? "上次提取已取消" : data.status === "completed" ? "上次提取已完成" : data.status === "partial" ? "上次提取部分完成" : "上次提取失败";
-          activeTasks.delete(taskId); renderAll(); return;
+          activeTasks.delete(taskId); scheduleRender(); return;
         }
-        renderAll();
+        scheduleRender();
       }
     }
 

@@ -1,7 +1,7 @@
-"""vision.py —— 视觉专家：并发调用 mimo-v2.5 分析论文图片，产出 image_summary。
+"""vision.py —— 视觉专家：并发调用 qwen3.6-flash 分析论文图片，产出 image_summary。
 
 设计要点：
-  - 视觉专家固定由 config/models.yaml 的 vision: 段指定（默认 mimo-v2.5），
+  - 视觉专家固定由 config/models.yaml 的 vision: 段指定（默认 qwen3.6-flash），
     与文本分析所选模型解耦（文本按前端下拉选中的 provider）。
   - 信号量限并发（concurrency），每调用带 batch_per_call 张图，429/超时指数退避重试。
   - 全失败返回 ''，由调用方纯文本兜底，不中断整篇。
@@ -10,11 +10,15 @@
 import asyncio
 import base64
 import io
+import logging
+import time
 from openai import OpenAI
 from PIL import Image
 
 from ai_client import get_model_config, create_client, get_vision_config
 from runtime_config import RUNTIME_CONFIG
+
+logger = logging.getLogger("paper.vision")
 
 VISION_SYSTEM = (
     "你是材料科学论文的图表分析专家。下面给出一篇论文的若干张图，每张图都有真实图号。"
@@ -92,13 +96,30 @@ async def analyze_images(images: list, provider: str = None) -> str:
     async def _one(batch):
         async with sem:
             last = None
+            started = time.perf_counter()
             for attempt in range(cfg["max_retries"] + 1):
                 try:
-                    return await asyncio.to_thread(_vision_call, client, model, batch)
+                    result = await asyncio.to_thread(_vision_call, client, model, batch)
+                    logger.info(
+                        "视觉批次完成 model=%s images=%d attempts=%d elapsed_ms=%.1f",
+                        model, len(batch), attempt + 1,
+                        (time.perf_counter() - started) * 1000,
+                    )
+                    return result
                 except Exception as e:        # 含 429 RateLimitError
                     last = e
                     if attempt < cfg["max_retries"]:
+                        logger.warning(
+                            "视觉批次失败，将重试 model=%s images=%d attempt=%d/%d error=%s",
+                            model, len(batch), attempt + 1, cfg["max_retries"] + 1,
+                            str(e)[:240],
+                        )
                         await asyncio.sleep(min(30, 2 ** attempt))   # 指数退避
+                    else:
+                        logger.exception(
+                            "视觉批次最终失败 model=%s images=%d attempts=%d",
+                            model, len(batch), attempt + 1,
+                        )
             return f"[看图失败] {last}"
 
     parts = await asyncio.gather(*[_one(b) for b in batches])

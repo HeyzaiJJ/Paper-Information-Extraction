@@ -1350,7 +1350,7 @@ button:disabled { background: #a8c9c4; cursor: not-allowed; }
   .card { padding: 16px; }
 }
 
-/* ==================== 知识库：手工归档工作区 ==================== */
+/* ==================== 知识库工作区 ==================== */
 .knowledge-layout {
   --knowledge-tree-width: 300px;
   display: flex;
@@ -1572,6 +1572,25 @@ button.knowledge-breadcrumb-part:hover { background: transparent; color: #0b625b
 .knowledge-inline-empty { padding: 22px 14px; border: 1px dashed #cbd8da; border-radius: 6px; color: #687983; font-size: 13px; line-height: 1.65; }
 .knowledge-overview-list { border-top: 1px solid #dce6e7; }
 .knowledge-full-list { margin-top: 14px; }
+.knowledge-manage-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 14px;
+  padding: 10px 12px;
+  border: 1px solid #cfe4e0;
+  border-radius: 8px;
+  background: #f0f8f6;
+}
+.knowledge-manage-toolbar.is-hidden { display: none; }
+.knowledge-select-all { display: inline-flex; align-items: center; gap: 7px; color: #42515b; font-size: 13px; cursor: pointer; }
+.knowledge-select-all input,
+.knowledge-report-select { width: 16px; height: 16px; margin: 0; accent-color: #0f766e; }
+.knowledge-manage-count { margin-right: auto; color: #687983; font-size: 12px; font-variant-numeric: tabular-nums; }
+.knowledge-manage-toolbar button { margin: 0; padding: 7px 12px; border-radius: 6px; font-size: 13px; }
+.knowledge-manage-cancel { border: 1px solid #cbd8da; background: #ffffff; color: #52636d; }
+.knowledge-manage-cancel:hover { background: #ffffff; border-color: #0f766e; color: #0b625b; }
+.knowledge-manage-toolbar button:disabled { opacity: .5; cursor: not-allowed; }
 .knowledge-report-list-item {
   display: flex;
   width: 100%;
@@ -1587,6 +1606,10 @@ button.knowledge-breadcrumb-part:hover { background: transparent; color: #0b625b
   color: #263940;
   text-align: left;
 }
+.knowledge-report-list-item.is-managing { cursor: pointer; gap: 12px; }
+.knowledge-report-list-item.is-managing .knowledge-report-list-main { min-width: 0; }
+.knowledge-report-list-item.is-managing.is-selected { background: #e5f4f1; box-shadow: inset 3px 0 0 #0f766e; }
+.knowledge-report-select { flex: none; }
 .knowledge-report-list-item:hover { background: #f2f8f7; }
 .knowledge-report-list-main { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: 4px; }
 .knowledge-report-list-title { overflow: hidden; font-size: 14px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
@@ -1687,6 +1710,16 @@ button.knowledge-breadcrumb-part:hover { background: transparent; color: #0b625b
 .knowledge-archive-empty p { margin: 0 0 4px; }
 .knowledge-selection-count { margin-right: auto; color: #687983; font-size: 12px; }
 .knowledge-delete-dialog { width: min(460px, calc(100vw - 32px)); }
+.knowledge-manage-dialog { width: min(520px, calc(100vw - 32px)); }
+.knowledge-manage-body { display: flex; flex-direction: column; gap: 10px; }
+.knowledge-action-choice { display: flex; gap: 18px; margin: 0 0 4px; padding: 0; border: 0; }
+.knowledge-action-choice legend { margin-bottom: 7px; color: #42515b; font-size: 13px; font-weight: 600; }
+.knowledge-action-choice label { display: inline-flex; align-items: center; gap: 7px; color: #42515b; font-size: 13px; cursor: pointer; }
+.knowledge-action-choice input { accent-color: #0f766e; }
+.knowledge-manage-body > label { margin: 0; color: #42515b; font-size: 13px; font-weight: 600; }
+.knowledge-manage-body select { width: 100%; padding: 9px 10px; border: 1px solid #cbd8da; border-radius: 6px; background: #ffffff; color: #263940; font: inherit; font-size: 14px; }
+.knowledge-manage-body select:focus { outline: none; border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15, 118, 110, .12); }
+.knowledge-manage-empty { padding: 12px; border: 1px dashed #cbd8da; border-radius: 6px; color: #687983; font-size: 13px; }
 
 @media (max-width: 850px) {
   .knowledge-layout { display: block; overflow: auto; }
@@ -1703,6 +1736,10 @@ button.knowledge-breadcrumb-part:hover { background: transparent; color: #0b625b
   .knowledge-report-heading { flex-direction: column; margin-bottom: 18px; }
   .knowledge-report-actions { width: 100%; flex-wrap: wrap; }
   .knowledge-report-actions button { flex: 1; }
+  .knowledge-manage-toolbar { align-items: stretch; flex-wrap: wrap; }
+  .knowledge-manage-count { flex: 1 0 100%; margin-right: 0; }
+  .knowledge-manage-toolbar button { flex: 1; }
+  .knowledge-action-choice { flex-direction: column; gap: 8px; }
   .report-paper-head { gap: 8px; padding: 10px 12px; }
   .report-paper-archive { margin-left: 4px; }
   .report-paper-model { display: none; }
@@ -2313,15 +2350,50 @@ button.knowledge-breadcrumb-part:hover { background: transparent; color: #0b625b
       background: var(--mw-surface-tint);
     }
 
-    #material-workspace-v2 .mw-report {
-      padding-top: 16px;
-      line-height: 1.7;
-    }
+#material-workspace-v2 .mw-report {
+  padding-top: 16px;
+  line-height: 1.7;
+}
 
     #material-workspace-v2 .mw-report h4,
     #material-workspace-v2 .mw-report p { margin: 0; }
-    #material-workspace-v2 .mw-report h4 { font-weight: 500; }
-    #material-workspace-v2 .mw-report p { margin-top: 8px; color: var(--mw-muted); }
+#material-workspace-v2 .mw-report h4 { font-weight: 500; }
+#material-workspace-v2 .mw-report p { margin-top: 8px; color: var(--mw-muted); }
+
+/* Material report typography follows the established “材料与性能信息”
+   report scale.  Keep analysis prose readable and black; only metadata/state
+   text outside .mw-report-markdown uses the muted UI color above. */
+#material-workspace-v2 .mw-report-markdown {
+  color: #000;
+  font-size: 16px;
+  line-height: 1.85;
+  word-break: break-word;
+}
+#material-workspace-v2 .mw-report-markdown p {
+  margin: 0 0 10px;
+  color: #000;
+}
+#material-workspace-v2 .mw-report-markdown h1,
+#material-workspace-v2 .mw-report-markdown h2,
+#material-workspace-v2 .mw-report-markdown h3,
+#material-workspace-v2 .mw-report-markdown h4,
+#material-workspace-v2 .mw-report-markdown h5,
+#material-workspace-v2 .mw-report-markdown h6,
+#material-workspace-v2 .mw-report-markdown strong,
+#material-workspace-v2 .mw-report-markdown b,
+#material-workspace-v2 .mw-report-markdown dt,
+#material-workspace-v2 .mw-report-markdown th {
+  color: #111;
+}
+#material-workspace-v2 .mw-report-markdown h1 { font-size: 1.5em; }
+#material-workspace-v2 .mw-report-markdown h2 { font-size: 1.17em; }
+#material-workspace-v2 .mw-report-markdown h3,
+#material-workspace-v2 .mw-report-markdown h4,
+#material-workspace-v2 .mw-report-markdown h5,
+#material-workspace-v2 .mw-report-markdown h6 { font-size: 1em; }
+#material-workspace-v2 .mw-report-markdown table,
+#material-workspace-v2 .mw-report-markdown td,
+#material-workspace-v2 .mw-report-markdown th { color: #000; }
 
     #material-workspace-v2 .mw-report-table-wrap {
       margin-top: 14px;

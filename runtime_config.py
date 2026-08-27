@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import importlib.metadata
 import json
+import logging
 import os
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,7 @@ from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_CONFIG_PATH = BASE_DIR / "config" / "runtime.yaml"
+logger = logging.getLogger("paper.runtime")
 
 
 @dataclass(frozen=True)
@@ -56,6 +58,10 @@ class RuntimeConfig:
     @property
     def export(self) -> dict[str, Any]:
         return self.section("export")
+
+    @property
+    def logging(self) -> dict[str, Any]:
+        return self.section("logging")
 
 
 _CONFIG: RuntimeConfig | None = None
@@ -181,6 +187,7 @@ def check_remote_inference(config: RuntimeConfig | None = None) -> dict[str, Any
             models.raise_for_status()
             model_payload = models.json()
     except Exception as exc:
+        logger.exception("远程 Surya/vLLM 健康检查失败 url=%s", root_url)
         raise RuntimeError(
             f"远程 Surya/vLLM 不可达（{root_url}）；已禁止回退本地主模型：{exc}"
         ) from exc
@@ -213,6 +220,7 @@ def check_local_ocr_error(config: RuntimeConfig | None = None) -> dict[str, Any]
         response.raise_for_status()
         return response.json() if response.content else {"status": "ok"}
     except Exception as exc:
+        logger.exception("本地 OCR Error 健康检查失败 url=%s", url)
         raise RuntimeError(f"本地 OCR Error 服务健康检查失败（{url}）：{exc}") from exc
 
 

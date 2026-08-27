@@ -45,3 +45,11 @@ storage:
 export:
   image_directory: images
   include_marker_metadata: true
+
+logging:
+  enabled: true
+  directory: data/logs
+  level: INFO
+  max_bytes: 31457280
+  backup_count: 10
+  console: true

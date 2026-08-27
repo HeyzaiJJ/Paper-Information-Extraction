@@ -48,7 +48,7 @@
 
                 <button type="submit" id="submit-btn">转换</button>
                 <div class="progress-list is-hidden" id="progress"></div>
-                <div class="tip">固定使用 Marker 2.0 balanced 模式，最多同时转换 3 篇。完成后直接下载 ZIP；每篇论文包含 Markdown、元数据和独立 images 文件夹。</div>
+                <div class="tip">固定使用 Marker 2.0 balanced 模式，最多同时转换 3 篇。完成后直接下载 ZIP；每篇论文包含 Markdown、JSON 元数据和独立 images 文件夹，压缩包路径已做短化以兼容 Windows 解压。</div>
                 <div class="status" id="status"></div>
               </form>
             </div>
@@ -147,14 +147,13 @@
         </div>
       </section>
 
-      <!-- ======== 工作区 4：知识库（当前仅在页面会话中保存） ======== -->
+      <!-- ======== 工作区 4：知识库 ======== -->
       <section class="workspace is-hidden" id="ws-knowledge">
         <div class="knowledge-layout" id="knowledge-layout">
           <aside class="knowledge-tree-panel" aria-label="知识库目录">
             <div class="knowledge-tree-head">
               <div>
                 <h1 class="knowledge-title">知识库</h1>
-                <p class="knowledge-subtitle">手工归档的分析报告</p>
               </div>
               <button type="button" class="knowledge-icon-btn" id="knowledge-new-folder-icon" title="新建归档文件夹" aria-label="新建归档文件夹">＋</button>
             </div>
@@ -246,6 +245,49 @@
           <div class="knowledge-dialog-actions">
             <button type="button" class="knowledge-dialog-cancel" id="knowledge-delete-cancel">取消</button>
             <button type="button" class="knowledge-dialog-danger" id="knowledge-delete-confirm">删除文件夹</button>
+          </div>
+        </form>
+      </dialog>
+
+      <dialog class="knowledge-dialog knowledge-manage-dialog" id="knowledge-manage-dialog" aria-labelledby="knowledge-manage-dialog-title">
+        <form method="dialog" class="knowledge-dialog-form" id="knowledge-manage-form">
+          <div class="knowledge-dialog-head">
+            <div>
+              <h2 id="knowledge-manage-dialog-title">移动或复制论文</h2>
+              <p id="knowledge-manage-dialog-copy"></p>
+            </div>
+            <button type="button" class="knowledge-dialog-close" id="knowledge-manage-cancel-icon" title="关闭" aria-label="关闭">×</button>
+          </div>
+          <div class="knowledge-dialog-body knowledge-manage-body">
+            <fieldset class="knowledge-action-choice">
+              <legend>操作方式</legend>
+              <label><input type="radio" name="knowledge-manage-action" value="move" checked> 移动到目标文件夹</label>
+              <label><input type="radio" name="knowledge-manage-action" value="copy"> 复制到目标文件夹</label>
+            </fieldset>
+            <label for="knowledge-manage-target">目标文件夹</label>
+            <select id="knowledge-manage-target"></select>
+            <p class="knowledge-field-error is-hidden" id="knowledge-manage-error"></p>
+            <div class="knowledge-manage-empty is-hidden" id="knowledge-manage-empty">没有可用的目标文件夹，请先新建一个文件夹。</div>
+          </div>
+          <div class="knowledge-dialog-actions">
+            <button type="button" class="knowledge-dialog-cancel" id="knowledge-manage-cancel">取消</button>
+            <button type="submit" class="knowledge-dialog-confirm" id="knowledge-manage-confirm" disabled>确认移动</button>
+          </div>
+        </form>
+      </dialog>
+
+      <dialog class="knowledge-dialog knowledge-delete-dialog" id="knowledge-report-delete-dialog" aria-labelledby="knowledge-report-delete-dialog-title">
+        <form method="dialog" class="knowledge-dialog-form">
+          <div class="knowledge-dialog-head">
+            <div>
+              <h2 id="knowledge-report-delete-dialog-title">永久删除报告？</h2>
+              <p id="knowledge-report-delete-dialog-copy"></p>
+            </div>
+            <button type="button" class="knowledge-dialog-close" id="knowledge-report-delete-cancel-icon" title="关闭" aria-label="关闭">×</button>
+          </div>
+          <div class="knowledge-dialog-actions">
+            <button type="button" class="knowledge-dialog-cancel" id="knowledge-report-delete-cancel">取消</button>
+            <button type="button" class="knowledge-dialog-danger" id="knowledge-report-delete-confirm">永久删除</button>
           </div>
         </form>
       </dialog>

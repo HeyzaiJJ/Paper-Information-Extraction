@@ -33,6 +33,7 @@ data/
 
 # Logs and temporary files
 *.log
+data/logs/
 *.tmp
 *.temp
 ~$*

@@ -10,14 +10,18 @@ ai_client.py —— AI 模型调用核心基础设施（v3.1 多模型版）
 """
 
 import json
+import logging
 import os
 import re
+import time
 from dataclasses import dataclass, field as dc_field
 from pathlib import Path
 
 import yaml
 import httpx
 from openai import OpenAI
+
+logger = logging.getLogger("paper.ai")
 
 # ============ 配置加载 ============
 
@@ -62,7 +66,7 @@ def get_model_config(provider: str = None) -> dict:
     dotenv = _load_dotenv()
     yaml_cfg = _load_model_config()
 
-    provider = provider or yaml_cfg.get("default_provider", "mimo")
+    provider = provider or yaml_cfg.get("default_provider", "mimo-v2.5-pro")
     prov = yaml_cfg.get("providers", {}).get(provider, {})
 
     api_key_env = prov.get("api_key_env", "")
@@ -97,6 +101,11 @@ def list_providers() -> list:
     default = yaml_cfg.get("default_provider")
     out = []
     for name, prov in providers.items():
+        # Providers marked selectable=false are reserved for internal jobs
+        # (currently the vision expert) and must not be accepted by the text
+        # extraction model picker/API.
+        if prov.get("selectable", True) is False:
+            continue
         ak = prov.get("api_key_env", "")
         configured = bool(os.getenv(ak, dotenv.get(ak, "")))
         out.append({
@@ -113,13 +122,13 @@ def list_providers() -> list:
 def get_vision_config() -> dict:
     """读取 models.yaml 的 vision: 段，带默认值。
 
-    视觉专家固定由该段指定的 provider（默认 mimo-v2.5）承担图片分析，
+    视觉专家固定由该段指定的 provider（默认 qwen3.6-flash）承担图片分析，
     与文本分析所选模型解耦。
     """
     yaml_cfg = _load_model_config()
     v = yaml_cfg.get("vision", {})
     return {
-        "provider": v.get("provider", "mimo-v2.5"),
+        "provider": v.get("provider", "qwen3.6-flash"),
         "concurrency": int(v.get("concurrency", 10)),
         "batch_per_call": int(v.get("batch_per_call", 3)),
         "max_images_per_paper": int(v.get("max_images_per_paper", 60)),
@@ -131,6 +140,7 @@ def create_client(cfg: dict = None) -> OpenAI:
     """创建 OpenAI 兼容客户端。"""
     cfg = cfg or get_model_config()
     if not cfg["api_key"]:
+        logger.warning("模型 API Key 未配置 provider=%s", cfg.get("provider", ""))
         raise RuntimeError(
             f"API Key 未配置（provider={cfg['provider']}，请在 .env 中设置 "
             f"{cfg.get('api_key_env') or '对应的 API Key 环境变量'}）"
@@ -142,10 +152,19 @@ def create_client(cfg: dict = None) -> OpenAI:
         trust_env=False,
         timeout=httpx.Timeout(600.0, connect=30.0),
     )
-    return OpenAI(
-        base_url=cfg["base_url"], api_key=cfg["api_key"],
-        timeout=600, http_client=http_client,
-    )
+    try:
+        client = OpenAI(
+            base_url=cfg["base_url"], api_key=cfg["api_key"],
+            timeout=600, http_client=http_client,
+        )
+    except Exception:
+        logger.exception("创建模型客户端失败 provider=%s", cfg.get("provider", ""))
+        raise
+    try:
+        client._paper_provider = cfg.get("provider", "")
+    except Exception:
+        pass
+    return client
 
 
 # ============ 工具函数 ============
@@ -175,7 +194,7 @@ def chat(
 ) -> str:
     """通用单次模型调用（公开接口）。
 
-    自动剥离推理类模型（qwen3.8 / deepseek-v4 等）返回的 <think>…</think> 思维链，
+    自动剥离推理类模型（qwen / deepseek-v4 等）返回的 <think>…</think> 思维链，
     避免污染后续 Markdown 渲染。
     """
     kwargs = {
@@ -187,9 +206,22 @@ def chat(
     if response_json:
         kwargs["response_format"] = {"type": "json_object"}
 
-    resp = client.chat.completions.create(**kwargs)
-    content = resp.choices[0].message.content or ""
+    started = time.perf_counter()
+    try:
+        resp = client.chat.completions.create(**kwargs)
+        content = resp.choices[0].message.content or ""
+    except Exception:
+        logger.exception(
+            "模型调用失败 provider_model=%s/%s elapsed_ms=%.1f",
+            getattr(client, "_paper_provider", "-"), model,
+            (time.perf_counter() - started) * 1000,
+        )
+        raise
     content = re.sub(r"<think[^>]*>[\s\S]*?</think>", "", content, flags=re.IGNORECASE).strip()
+    logger.info(
+        "模型调用完成 model=%s elapsed_ms=%.1f response_chars=%d",
+        model, (time.perf_counter() - started) * 1000, len(content),
+    )
     return content
 
 
