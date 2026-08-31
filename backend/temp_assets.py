@@ -22,10 +22,9 @@ from typing import Any, Iterable
 
 from PIL import Image
 
-from runtime_config import BASE_DIR, RUNTIME_CONFIG
+from backend.runtime_config import RUNTIME_CONFIG
+from backend.paths import DATA_DIR
 
-
-DATA_DIR = BASE_DIR / "data"
 STAGING_DIR = DATA_DIR / "staging"
 EXPORT_DIR = DATA_DIR / "exports"
 UPLOAD_DIR = DATA_DIR / "uploads"
@@ -74,6 +73,33 @@ def document_dir(document_id: str) -> Path:
     if not matches:
         raise FileNotFoundError(f"临时文档不存在或已过期：{document_id}")
     return matches[0]
+
+
+def delete_document_dir(document_id: str) -> bool:
+    """Delete every staging directory for one document id.
+
+    The lookup is constrained to ``STAGING_DIR/<task>/<document>`` and is
+    intentionally idempotent so cancellation/deletion retries are safe.
+    """
+    if not str(document_id or "").strip():
+        return False
+    normalized = safe_name(document_id)
+    staging_root = STAGING_DIR.resolve()
+    removed = False
+    for candidate in list(STAGING_DIR.glob(f"*/{normalized}")):
+        resolved = candidate.resolve()
+        if staging_root not in resolved.parents:
+            raise ValueError("非法临时文档路径")
+        if not resolved.is_dir():
+            continue
+        parent = resolved.parent
+        shutil.rmtree(resolved)
+        removed = True
+        try:
+            parent.rmdir()
+        except OSError:
+            pass
+    return removed
 
 
 def write_json(path: Path, payload: Any) -> None:

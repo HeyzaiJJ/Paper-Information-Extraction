@@ -21,16 +21,15 @@ import yaml
 import httpx
 from openai import OpenAI
 
+from backend.paths import BACKEND_ROOT, REPO_ROOT, CONFIG_DIR
+
 logger = logging.getLogger("paper.ai")
 
 # ============ 配置加载 ============
 
-BASE_DIR = Path(__file__).parent
-
-
 def _load_dotenv() -> dict:
     """极简 .env 解析。"""
-    env_path = BASE_DIR / ".env"
+    env_path = REPO_ROOT / ".env"
     cfg = {}
     if env_path.exists():
         for line in env_path.read_text(encoding="utf-8").splitlines():
@@ -44,8 +43,8 @@ def _load_dotenv() -> dict:
 
 
 def _load_model_config() -> dict:
-    """加载 config/models.yaml。"""
-    config_path = BASE_DIR / "config" / "models.yaml"
+    """加载 backend/config/models.yaml。"""
+    config_path = CONFIG_DIR / "models.yaml"
     if config_path.exists():
         with open(config_path, encoding="utf-8") as f:
             return yaml.safe_load(f)

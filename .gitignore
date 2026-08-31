@@ -27,6 +27,8 @@ Thumbs.db
 
 # Runtime data, databases, uploads, and exports
 data/
+backend/data/
+backend/data_legacy/
 *.sqlite3
 *.sqlite3-shm
 *.sqlite3-wal

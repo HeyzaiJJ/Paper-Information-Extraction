@@ -20,9 +20,10 @@ import httpx
 import yaml
 from dotenv import load_dotenv
 
+from backend.paths import BACKEND_ROOT, REPO_ROOT, CONFIG_DIR
 
-BASE_DIR = Path(__file__).resolve().parent
-DEFAULT_CONFIG_PATH = BASE_DIR / "config" / "runtime.yaml"
+BASE_DIR = BACKEND_ROOT
+DEFAULT_CONFIG_PATH = CONFIG_DIR / "runtime.yaml"
 logger = logging.getLogger("paper.runtime")
 
 
@@ -79,7 +80,7 @@ def load_runtime_config(path: str | os.PathLike[str] | None = None) -> RuntimeCo
         return _CONFIG
     if not config_path.exists():
         raise RuntimeError(f"运行时配置不存在：{config_path}")
-    load_dotenv(BASE_DIR / ".env", override=False)
+    load_dotenv(REPO_ROOT / ".env", override=False)
     with config_path.open("r", encoding="utf-8") as handle:
         payload = yaml.safe_load(handle) or {}
     if not isinstance(payload, dict):

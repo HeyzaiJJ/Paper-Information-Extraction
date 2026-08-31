@@ -14,7 +14,7 @@ from pathlib import Path
 import time
 from typing import Any, Callable
 
-from runtime_config import RUNTIME_CONFIG, apply_runtime_environment, marker_config_values
+from backend.runtime_config import RUNTIME_CONFIG, apply_runtime_environment, marker_config_values
 
 # Windows spawn imports this module afresh. Reapply before importing Marker/Surya.
 apply_runtime_environment(RUNTIME_CONFIG)
@@ -26,7 +26,7 @@ from marker.output import text_from_rendered
 from marker.renderers.json import JSONRenderer
 from marker.renderers.markdown import MarkdownRenderer
 
-from temp_assets import (
+from backend.temp_assets import (
     create_manifest,
     rewrite_markdown_image_paths,
     save_pil_images,

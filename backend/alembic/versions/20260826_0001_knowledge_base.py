@@ -7,7 +7,7 @@ Create Date: 2026-08-26
 
 from alembic import op
 
-from knowledge_db import Base
+from backend.knowledge_db import Base
 
 
 revision = "20260826_0001"

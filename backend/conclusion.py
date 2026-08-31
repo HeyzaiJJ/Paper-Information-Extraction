@@ -23,9 +23,10 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from ai_client import get_model_config, create_client, chat
-from prompts import render_conclusion_messages
-from preprocess.clean import preprocess, CleanResult
+from backend.ai_client import get_model_config, create_client, chat
+from backend.markdown_utils import escape_approximate_tildes
+from backend.prompts import render_conclusion_messages
+from backend.preprocess.clean import preprocess, CleanResult
 
 # 结论类任务低温度，与摘要/提取链一致
 CONCLUDE_TEMPERATURE = 0.1
@@ -69,7 +70,7 @@ def conclude_paper_markdown(client, model, clean: CleanResult, title: str = "",
         max_tokens=max_tokens,
         response_json=False,
     )
-    return _strip_code_fence(md)
+    return escape_approximate_tildes(_strip_code_fence(md))
 
 
 def conclude_from_clean_markdown(clean: CleanResult, title: str = "", provider: str = None,

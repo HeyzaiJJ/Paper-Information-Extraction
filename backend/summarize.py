@@ -19,9 +19,9 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from ai_client import get_model_config, create_client, chat
-from prompts import render_summary_messages, summary_mode
-from preprocess.clean import preprocess, CleanResult
+from backend.ai_client import get_model_config, create_client, chat
+from backend.prompts import render_summary_messages, summary_mode
+from backend.preprocess.clean import preprocess, CleanResult
 
 SUMMARIZE_TEMPERATURE = 0.1
 

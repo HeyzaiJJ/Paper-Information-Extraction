@@ -125,8 +125,33 @@ function download(filename, content, mime) {
 
 // Markdown 先转换为 HTML，再由 KaTeX 处理其中的 LaTeX 文本节点。
 // 未加载 KaTeX 时保留原始公式文本，确保离线预览仍可阅读。
+function escapeApproximateTildesForMarkdown(markdown) {
+  return String(markdown || "").replace(/(^|[^\\~])~(?=\s*\d)/g, "$1\\~");
+}
+window.escapeApproximateTildesForMarkdown = escapeApproximateTildesForMarkdown;
+
+// Markdown 只支持 1 到 6 级 ATX 标题。历史报告或模型偶尔会留下 7 级以上
+// 标题，marked 会将其当作普通文本；渲染/导出前将其安全收敛到 6 级。
+// 代码围栏中的内容不是报告标题，保持原样。
+function clampMarkdownHeadingLevels(markdown) {
+  const lines = String(markdown || "").split("\n");
+  let inFence = false;
+  return lines.map((line) => {
+    if (/^\s*```/.test(line)) {
+      inFence = !inFence;
+      return line;
+    }
+    if (!inFence) {
+      const match = line.match(/^(#{7,})(\s+.*)$/);
+      if (match) return `######${match[2]}`;
+    }
+    return line;
+  }).join("\n");
+}
+window.clampMarkdownHeadingLevels = clampMarkdownHeadingLevels;
+
 function renderMarkdown(container, markdown) {
-  const source = markdown || "";
+  const source = clampMarkdownHeadingLevels(escapeApproximateTildesForMarkdown(markdown));
   if (window.marked && marked.parse) container.innerHTML = marked.parse(source);
   else container.textContent = source;
   // 模型输出属于非可信内容：保留常用 Markdown/表格/图片，移除可执行节点与事件属性。
@@ -1201,6 +1226,13 @@ function stopConversion() {
 /* ==================== 共享：PDF 转换后产出的 MD 文件 ==================== */
 // 论文信息提取 / 针对材料信息提取 两个工作区都从这里取数据；刷新即清空（符合"刷新全重置"）
 const convertedFiles = [];   // { id, name, kind: 'md', content, figureIndex, ready }
+function createWorkspaceTaskId(prefix) {
+  const token = globalThis.crypto && typeof globalThis.crypto.randomUUID === "function"
+    ? globalThis.crypto.randomUUID()
+    : Date.now() + "_" + Math.random().toString(36).slice(2, 12);
+  return `${prefix}_${token}`;
+}
+
 function addConvertedFile(name, content, options = {}) {
   let rec = convertedFiles.find((c) => c.name === name);
   if (!rec) {
@@ -1219,6 +1251,9 @@ function addConvertedFile(name, content, options = {}) {
       prepareError: "",
       prepareElapsed: 0,
       prepareStartedAt: 0,
+      prepareTaskId: "",
+      prepareAbortController: null,
+      deleting: false,
     };
     convertedFiles.push(rec);
   } else {
@@ -1267,9 +1302,13 @@ async function preparePaperForMaterial(name, markdown, pdf, options = {}) {
   rec.prepareElapsed = 0;
   rec.prepareStartedAt = Date.now();
   const prepareRunId = (rec.prepareRunId || 0) + 1;
+  const prepareTaskId = createWorkspaceTaskId("prep");
   rec.prepareRunId = prepareRunId;
   rec.prepareOrigin = origin;
-  rec.prepareTaskId = "";
+  rec.prepareTaskId = prepareTaskId;
+  rec.serverDocumentId = "";
+  const prepareAbortController = new AbortController();
+  rec.prepareAbortController = prepareAbortController;
   if (options.select) {
     matSelected.add(rec.id);
     matColInfo.classList.remove("is-hidden");
@@ -1287,6 +1326,7 @@ async function preparePaperForMaterial(name, markdown, pdf, options = {}) {
     rec.prepareError = message || (status === "cancelled" ? "PDF 预处理已取消" : "PDF 预处理失败");
     rec.prepareStage = rec.prepareError;
     rec.prepareTaskId = "";
+    rec.prepareAbortController = null;
     rec.prepareElapsed = Math.max(0, Math.round((Date.now() - rec.prepareStartedAt) / 1000));
     renderMatFiles();
     renderAttachPanel();
@@ -1297,18 +1337,25 @@ async function preparePaperForMaterial(name, markdown, pdf, options = {}) {
   // Markdown 常含 base64 图片，作为文件 part 上传以避开普通表单字段的大小限制。
   const markdownBlob = new Blob([markdown || ""], { type: "text/markdown;charset=utf-8" });
   fd.append("markdown_file", markdownBlob, "converted.md");
+  fd.append("prepare_task_id", prepareTaskId);
+  fd.append("client_document_id", rec.id);
   let response;
   let started;
   try {
-    response = await fetch("/api/prepare_paper", { method: "POST", body: fd });
+    response = await fetch("/api/prepare_paper", {
+      method: "POST",
+      body: fd,
+      signal: prepareAbortController.signal,
+    });
     started = await response.json().catch(() => ({}));
   } catch (error) {
+    if (rec.prepareRunId !== prepareRunId || rec.deleting) return rec;
     const message = error && error.message ? error.message : "PDF 预处理任务提交失败";
     markPrepareFailure(message);
     throw error instanceof Error ? error : new Error(message);
   }
   if (rec.prepareRunId !== prepareRunId) {
-    if (started.task_id) fetch("/api/stop_paper_prepare/" + started.task_id, { method: "POST" }).catch(() => {});
+    if (started.task_id) await fetch("/api/stop_paper_prepare/" + started.task_id, { method: "POST" }).catch(() => {});
     return rec;
   }
   if (!response.ok || !started.task_id) {
@@ -1317,6 +1364,7 @@ async function preparePaperForMaterial(name, markdown, pdf, options = {}) {
     throw new Error(message);
   }
   rec.prepareTaskId = started.task_id;
+  rec.serverDocumentId = started.document_id || "";
 
   while (true) {
     await sleep(700);
@@ -1350,6 +1398,7 @@ async function preparePaperForMaterial(name, markdown, pdf, options = {}) {
     rec.prepareElapsed = Math.max(0, Math.round((Date.now() - rec.prepareStartedAt) / 1000));
     rec.prepareStage = "";
     rec.prepareTaskId = "";
+    rec.prepareAbortController = null;
     rec.sourcePdf = pdf;
     rec.sourceType = "PDF";
     renderMatFiles();
@@ -1946,6 +1995,54 @@ async function loadKnowledgeState(render = false) {
   }
 }
 
+async function cancelPaperPrepare(documentId, options = {}) {
+  const rec = convertedFiles.find((paper) => paper.id === documentId);
+  if (!rec) return { ok: true, missing: true };
+  const taskId = rec.prepareTaskId;
+  const cancelRunId = (rec.prepareRunId || 0) + 1;
+  rec.prepareRunId = cancelRunId;
+  rec.ready = false;
+  if (!options.forDelete) {
+    rec.prepareStatus = "cancelling";
+    rec.prepareStage = "正在取消…";
+  }
+  const controller = rec.prepareAbortController;
+  rec.prepareAbortController = null;
+  renderMatFiles();
+  renderAttachPanel();
+
+  const stopPromise = taskId
+    ? fetch("/api/stop_paper_prepare/" + encodeURIComponent(taskId), { method: "POST" })
+    : Promise.resolve(null);
+  if (controller) controller.abort();
+  try {
+    const response = await stopPromise;
+    const data = response ? await response.json().catch(() => ({})) : { ok: true };
+    if (response && !response.ok) throw new Error(data.error || "取消解析失败");
+    if (rec.prepareRunId === cancelRunId) {
+      rec.prepareTaskId = "";
+      if (!options.forDelete) {
+        rec.prepareStatus = "cancelled";
+        rec.prepareStage = "PDF 预处理已取消";
+        rec.prepareError = "";
+        rec.prepareElapsed = Math.max(0, Math.round((Date.now() - rec.prepareStartedAt) / 1000));
+      }
+    }
+    renderMatFiles();
+    renderAttachPanel();
+    return data;
+  } catch (error) {
+    if (rec.prepareRunId === cancelRunId && !options.forDelete) {
+      rec.prepareStatus = "failed";
+      rec.prepareError = error.message || "取消解析失败";
+      rec.prepareStage = rec.prepareError;
+      renderMatFiles();
+      renderAttachPanel();
+    }
+    throw error;
+  }
+}
+
 function newKnowledgeId(prefix) {
   return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 }
@@ -2535,12 +2632,7 @@ function createKnowledgeFolderOverview(folder) {
   deleteBtn.type = "button";
   deleteBtn.className = "knowledge-dialog-danger";
   deleteBtn.textContent = "删除";
-  const cancel = document.createElement("button");
-  cancel.type = "button";
-  cancel.className = "knowledge-manage-cancel";
-  cancel.textContent = "取消管理";
-  cancel.addEventListener("click", () => exitKnowledgeManageMode());
-  toolbar.append(selectAllLabel, selectedCount, move, deleteBtn, cancel);
+  toolbar.append(selectAllLabel, selectedCount, move, deleteBtn);
   if (managing) wrapper.appendChild(toolbar);
 
   const list = document.createElement("div");
@@ -3104,7 +3196,7 @@ function exportSingleMaterialReport(paper) {
     "\n\n## 三、综合结论与建议\n\n" +
     contentOf("part3", "（未生成结论）", true) +
     "\n";
-  const blob = new Blob([md], { type: "text/markdown;charset=utf-8" });
+  const blob = new Blob([clampMarkdownHeadingLevels(md)], { type: "text/markdown;charset=utf-8" });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
@@ -3211,22 +3303,63 @@ window.materialWorkspaceBridge = {
     return { ...matModelLabels };
   },
   preparePaperForMaterial,
+  cancelPrepare(documentId) {
+    return cancelPaperPrepare(documentId);
+  },
   async removeFile(documentId) {
-    const index = convertedFiles.findIndex((item) => item.id === documentId);
-    if (index < 0) return false;
-    const paper = convertedFiles[index];
+    const paper = convertedFiles.find((item) => item.id === documentId);
+    if (!paper) return false;
+    if (paper.deleting) return false;
+    paper.deleting = true;
+    const prepareTaskId = paper.prepareTaskId || "";
+    const serverDocumentId = paper.serverDocumentId || "";
     paper.prepareRunId = (paper.prepareRunId || 0) + 1;
-    if (paper.prepareTaskId) {
-      await fetch("/api/stop_paper_prepare/" + paper.prepareTaskId, { method: "POST" }).catch(() => {});
-      paper.prepareTaskId = "";
+    const controller = paper.prepareAbortController;
+    paper.prepareAbortController = null;
+    const deletePromise = fetch("/api/material_documents/" + encodeURIComponent(documentId), {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        prepare_task_id: prepareTaskId,
+        server_document_id: serverDocumentId,
+      }),
+    });
+    if (controller) controller.abort();
+    let response;
+    let data;
+    try {
+      response = await deletePromise;
+      data = await response.json().catch(() => ({}));
+      const remainingPids = Array.isArray(data.remaining_pids) ? data.remaining_pids : [];
+      if (!response.ok || !data.ok || remainingPids.length) {
+        const suffix = remainingPids.length ? `（残留 PID：${remainingPids.join(", ")}）` : "";
+        throw new Error((data.error || "删除 PDF 任务失败") + suffix);
+      }
+    } catch (error) {
+      paper.deleting = false;
+      paper.prepareStatus = "failed";
+      paper.prepareError = error.message || "删除 PDF 任务失败";
+      paper.prepareStage = paper.prepareError;
+      renderMatFiles();
+      renderAttachPanel();
+      throw error;
     }
-    convertedFiles.splice(index, 1);
+    // Re-resolve by id after awaiting the backend. Never reuse a stale array
+    // index: concurrent deletions may have shifted every following row.
+    const currentIndex = convertedFiles.findIndex((item) => item.id === documentId);
+    if (currentIndex >= 0) convertedFiles.splice(currentIndex, 1);
     matSelected.delete(documentId);
+    [...matResults.keys()].forEach((key) => {
+      if (key === documentId || key.startsWith(documentId + "::")) matResults.delete(key);
+    });
+    [...matExpanded].forEach((key) => {
+      if (key === documentId || String(key).startsWith(documentId + "::")) matExpanded.delete(key);
+    });
     if (typeof chatAttachPapers !== "undefined") chatAttachPapers.delete(documentId);
     renderMatFiles();
     renderAttachPanel();
     renderChips();
-    return true;
+    return data;
   },
   renderMarkdown(container, markdown) {
     renderMarkdown(container, markdown || "");

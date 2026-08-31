@@ -24,8 +24,8 @@ from sqlalchemy import (
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
 
-from runtime_config import BASE_DIR, RUNTIME_CONFIG
-from temp_assets import document_dir, read_json
+from backend.runtime_config import BASE_DIR, RUNTIME_CONFIG
+from backend.temp_assets import document_dir, read_json
 
 
 def _utcnow() -> datetime:

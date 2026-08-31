@@ -15,8 +15,8 @@ import time
 from openai import OpenAI
 from PIL import Image
 
-from ai_client import get_model_config, create_client, get_vision_config
-from runtime_config import RUNTIME_CONFIG
+from backend.ai_client import get_model_config, create_client, get_vision_config
+from backend.runtime_config import RUNTIME_CONFIG
 
 logger = logging.getLogger("paper.vision")
 

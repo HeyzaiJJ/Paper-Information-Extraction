@@ -25,9 +25,10 @@ import argparse
 import re
 from pathlib import Path
 
-from ai_client import get_model_config, create_client, chat
-from prompts import render_material_md_messages
-from preprocess.clean import preprocess, CleanResult
+from backend.ai_client import get_model_config, create_client, chat
+from backend.markdown_utils import escape_approximate_tildes
+from backend.prompts import render_material_md_messages
+from backend.preprocess.clean import preprocess, CleanResult
 
 # 提取类任务低温度；与摘要链一致
 EXTRACT_TEMPERATURE = 0.1
@@ -57,27 +58,27 @@ def _strip_code_fence(md: str) -> str:
 
 
 def _downgrade_headings(md: str) -> str:
-    """把 v2 输出的标题整体降一级，使其在「二、材料成分配比与性能参数对比」之下正确嵌套。"""
-    out = []
-    for line in (md or "").splitlines():
-        m = re.match(r"^(#{2,6})\s", line)
-        if m:
-            lvl = len(m.group(1))
-            out.append("#" * (lvl + 1) + line[lvl:])
-        else:
-            out.append(line)
-    return "\n".join(out)
+    """把输出标题整体降一级，并将 Markdown 标题层级限制在 6 级以内。
 
-
-def escape_approximate_tildes(md: str) -> str:
-    """Escape ``~25%``-style approximate values before Markdown rendering.
-
-    marked enables single-tilde strikethrough, so two approximate values in
-    one paragraph can accidentally turn everything between them into deleted
-    text. Preserve intentional ``~~deleted~~`` syntax while escaping an
-    unescaped tilde immediately followed by a numeric value.
+    Markdown 最多支持 ``######`` 六级标题。模型偶尔输出六级标题时，
+    若继续无上限降级会产生七个 ``#``，随后被前端当作普通文本显示。
+    代码围栏中的内容不是报告标题，必须保持原样。
     """
-    return re.sub(r"(?<![\\~])~(?=\s*\d)", r"\\~", md or "")
+    out = []
+    in_fence = False
+    for line in (md or "").splitlines():
+        if re.match(r"^\s*```", line):
+            in_fence = not in_fence
+            out.append(line)
+            continue
+        if not in_fence:
+            m = re.match(r"^(#{2,})(\s+)(.*)$", line)
+            if m:
+                lvl = min(len(m.group(1)) + 1, 6)
+                out.append("#" * lvl + m.group(2) + m.group(3))
+                continue
+        out.append(line)
+    return "\n".join(out)
 
 
 def normalize_list_indentation(md: str) -> str:

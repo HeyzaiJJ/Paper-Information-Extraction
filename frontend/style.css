@@ -1588,8 +1588,6 @@ button.knowledge-breadcrumb-part:hover { background: transparent; color: #0b625b
 .knowledge-report-select { width: 16px; height: 16px; margin: 0; accent-color: #0f766e; }
 .knowledge-manage-count { margin-right: auto; color: #687983; font-size: 12px; font-variant-numeric: tabular-nums; }
 .knowledge-manage-toolbar button { margin: 0; padding: 7px 12px; border-radius: 6px; font-size: 13px; }
-.knowledge-manage-cancel { border: 1px solid #cbd8da; background: #ffffff; color: #52636d; }
-.knowledge-manage-cancel:hover { background: #ffffff; border-color: #0f766e; color: #0b625b; }
 .knowledge-manage-toolbar button:disabled { opacity: .5; cursor: not-allowed; }
 .knowledge-report-list-item {
   display: flex;
@@ -1901,9 +1899,12 @@ button.knowledge-breadcrumb-part:hover { background: transparent; color: #0b625b
     }
 
     #material-workspace-v2 .mw-control {
+      display: flex;
       flex: 0 0 auto;
+      flex-direction: column;
+      min-height: 0;
       overflow: hidden;
-      max-height: 500px;
+      max-height: clamp(360px, 52vh, 620px);
       background: var(--mw-surface);
       border: 1px solid var(--mw-border);
       border-radius: 8px;
@@ -1955,7 +1956,17 @@ button.knowledge-breadcrumb-part:hover { background: transparent; color: #0b625b
     #material-workspace-v2 .mw-action-button:hover,
     #material-workspace-v2 .mw-link-button:hover { background: var(--mw-surface-soft); }
 
-    #material-workspace-v2 .mw-control-body { padding: 0 16px 14px; }
+    #material-workspace-v2 .mw-control-body {
+      flex: 1 1 auto;
+      min-height: 0;
+      overflow-x: auto;
+      overflow-y: auto;
+      overscroll-behavior: contain;
+      scrollbar-gutter: stable;
+      padding: 0 16px 14px;
+      box-shadow: inset 0 10px 16px -20px color-mix(in srgb, var(--mw-text) 55%, transparent),
+        inset 0 -10px 16px -20px color-mix(in srgb, var(--mw-text) 55%, transparent);
+    }
 
     #material-workspace-v2 .mw-files-table {
       width: 100%;
@@ -1976,6 +1987,14 @@ button.knowledge-breadcrumb-part:hover { background: transparent; color: #0b625b
       color: var(--mw-muted);
       font-weight: 400;
       background: var(--mw-surface-soft);
+    }
+
+    #material-workspace-v2 .mw-files-table thead th {
+      position: sticky;
+      top: 0;
+      z-index: 2;
+      background: var(--mw-surface-soft);
+      box-shadow: 0 1px 0 var(--mw-border);
     }
 
     #material-workspace-v2 .mw-files-table th:nth-child(1) { width: 6%; }
@@ -2150,54 +2169,6 @@ button.knowledge-breadcrumb-part:hover { background: transparent; color: #0b625b
       background: var(--mw-surface);
       border: 1px solid var(--mw-border);
       border-radius: 5px;
-    }
-
-    #material-workspace-v2 .mw-part-picker {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 18px;
-      padding-top: 12px;
-    }
-
-    #material-workspace-v2 .mw-part-selection {
-      display: flex;
-      flex-wrap: wrap;
-      align-items: center;
-      gap: 8px 12px;
-      min-width: 0;
-    }
-
-    #material-workspace-v2 .mw-part-title {
-      flex: 0 0 100%;
-      color: var(--mw-muted);
-    }
-
-    #material-workspace-v2 .mw-part-option {
-      display: inline-flex;
-      align-items: center;
-      min-height: 34px;
-      padding: 6px 11px;
-      color: var(--mw-muted);
-      background: var(--mw-surface);
-      border: 1px solid var(--mw-border);
-      border-radius: 5px;
-      cursor: pointer;
-      white-space: nowrap;
-    }
-
-    #material-workspace-v2 .mw-part-option.is-selected {
-      color: var(--mw-primary);
-      background: var(--mw-surface-tint);
-      border-color: color-mix(in srgb, var(--mw-primary) 50%, var(--mw-border));
-    }
-
-    #material-workspace-v2 .mw-part-choice {
-      position: absolute;
-      width: 1px;
-      height: 1px;
-      opacity: 0;
-      pointer-events: none;
     }
 
     #material-workspace-v2 .mw-execute-row {
@@ -2479,7 +2450,6 @@ button.knowledge-breadcrumb-part:hover { background: transparent; color: #0b625b
       }
       #material-workspace-v2 .mw-control-summary { display: none; }
       #material-workspace-v2 .mw-control-foot { align-items: flex-start; flex-direction: column; }
-      #material-workspace-v2 .mw-part-picker { align-items: flex-start; flex-direction: column; }
       #material-workspace-v2 .mw-execute-row { width: 100%; margin-left: 0; justify-content: flex-end; }
       #material-workspace-v2 .mw-model-field { width: 100%; }
       #material-workspace-v2 .mw-select { flex: 1; min-width: 0; }
@@ -2509,14 +2479,6 @@ button.knowledge-breadcrumb-part:hover { background: transparent; color: #0b625b
   display: flex;
   flex-wrap: wrap;
   align-items: flex-end;
-}
-#material-workspace-v2 .mw-control-foot > .mw-part-picker {
-  flex: 1 1 560px;
-  padding-top: 0;
-}
-#material-workspace-v2 .mw-control-foot > .mw-execute-row {
-  flex: 0 0 auto;
-  margin-left: auto;
 }
 #material-workspace-v2 .mw-detail-content { min-width: 0; }
 #material-workspace-v2 .mw-detail-empty { padding-top: 72px; }
@@ -2593,10 +2555,11 @@ button.knowledge-breadcrumb-part:hover { background: transparent; color: #0b625b
   #material-workspace-v2 .mw-tab { min-width: 132px; }
 }
 
-/* V2 control footer: match the two-row extraction layout. */
 #material-workspace-v2 .mw-control-foot {
+  flex: 0 0 auto;
   display: block;
   padding: 0 16px 10px;
+  background: var(--mw-surface);
   border-bottom: 0;
 }
 #material-workspace-v2 .mw-add-file-row {
@@ -2612,27 +2575,14 @@ button.knowledge-breadcrumb-part:hover { background: transparent; color: #0b625b
   gap: 20px;
   padding-top: 20px;
 }
-#material-workspace-v2 .mw-extraction-options-row > .mw-part-picker {
-  flex: 1 1 auto;
-  min-width: 0;
-  padding-top: 0;
-}
 #material-workspace-v2 .mw-extraction-options-row > .mw-execute-row {
   flex: 0 0 auto;
   margin-left: auto;
 }
-#material-workspace-v2 .mw-part-selection {
-  gap: 10px 16px;
-}
-#material-workspace-v2 .mw-part-title {
-  margin-bottom: 0;
-}
-#material-workspace-v2 .mw-part-hint {
-  color: var(--mw-muted);
-  font-size: 12px;
-  line-height: 1.45;
-}
 @media (max-width: 980px) {
+  #material-workspace-v2 .mw-control {
+    max-height: min(58vh, 560px);
+  }
   #material-workspace-v2 .mw-extraction-options-row {
     align-items: stretch;
     flex-direction: column;
@@ -2640,6 +2590,15 @@ button.knowledge-breadcrumb-part:hover { background: transparent; color: #0b625b
   #material-workspace-v2 .mw-extraction-options-row > .mw-execute-row {
     width: 100%;
     margin-left: 0;
+  }
+}
+
+@media (max-width: 700px) {
+  #material-workspace-v2 .mw-control {
+    max-height: min(62vh, 520px);
+  }
+  #material-workspace-v2 .mw-files-table {
+    min-width: 760px;
   }
 }
 
@@ -2770,5 +2729,58 @@ button.knowledge-breadcrumb-part:hover { background: transparent; color: #0b625b
     width: 100%;
     max-height: none;
     flex-basis: auto;
+  }
+}
+
+/* Material extraction controls: keep add-file and execute controls on one row. */
+#material-workspace-v2 .mw-control-foot {
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: 16px;
+}
+#material-workspace-v2 .mw-control-foot .mw-add-file-row {
+  flex: 0 0 auto;
+  width: auto;
+  min-height: 46px;
+  border-bottom: 0;
+}
+#material-workspace-v2 .mw-control-foot .mw-extraction-options-row {
+  flex: 0 0 auto;
+  min-width: 0;
+  align-items: center;
+  gap: 16px;
+  padding-top: 0;
+  margin-left: auto;
+}
+#material-workspace-v2 .mw-control-foot .mw-extraction-options-row > .mw-execute-row {
+  flex: 0 0 auto;
+  margin-left: auto;
+}
+@media (max-width: 980px) {
+  #material-workspace-v2 .mw-control-foot {
+    flex-wrap: wrap;
+  }
+  #material-workspace-v2 .mw-control-foot .mw-extraction-options-row {
+    flex: 1 1 100%;
+    flex-direction: column;
+    align-items: stretch;
+    padding-top: 14px;
+    margin-left: 0;
+  }
+  #material-workspace-v2 .mw-control-foot .mw-extraction-options-row > .mw-execute-row {
+    width: 100%;
+    margin-left: 0;
+  }
+}
+@media (max-width: 700px) {
+  #material-workspace-v2 .mw-control-foot {
+    flex-direction: column;
+    flex-wrap: nowrap;
+    align-items: stretch;
+  }
+  #material-workspace-v2 .mw-control-foot .mw-add-file-row {
+    width: 100%;
   }
 }

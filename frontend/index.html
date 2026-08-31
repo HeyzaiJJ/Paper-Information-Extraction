@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{{ title }}</title>
-  <link rel="stylesheet" href="/static/style.css?v=20260820-plain-report15">
+  <link rel="stylesheet" href="/static/style.css?v=20260827-control-layout3">
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/katex.min.css">
   <!-- 用于把 markdown 渲染成可读预览；离线时自动降级为纯文本 -->
 </head>
@@ -129,12 +129,6 @@
                       <input type="file" id="mw-add-file-input" accept="application/pdf,.pdf" multiple hidden>
                     </div>
                     <div class="mw-extraction-options-row">
-                      <div class="mw-part-picker">
-                        <div class="mw-part-selection">
-                          <span class="mw-part-title">按文件选择提取部分</span>
-                          <span class="mw-part-hint">在每个文件行单独勾选所需部分；启动、进度、取消和结果均按“文件 + 部分”独立处理。</span>
-                        </div>
-                      </div>
                       <div class="mw-execute-row"><button class="mw-start" id="mw-start" type="button" disabled>请选择</button><select class="mw-select" id="mw-model" aria-label="选择模型"></select></div>
                     </div>
                   </div>
@@ -298,8 +292,8 @@
   <script src="https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/katex.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/contrib/auto-render.min.js"></script>
   <script src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js"></script>
-  <script src="/static/app.js?v=20260820-file-part-isolation1"></script>
-  <script src="/static/material-workspace-preview.js?v=20260820-file-part-isolation1"></script>
+  <script src="/static/app.js?v=20260827-pdf-process-tree2"></script>
+  <script src="/static/material-workspace-preview.js?v=20260827-pdf-process-tree2"></script>
 </body>
 </html>
 

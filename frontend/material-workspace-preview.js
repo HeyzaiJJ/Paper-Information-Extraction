@@ -32,11 +32,16 @@
     const selectedDocuments = new Set();
     const selectedPartsByDocument = new Map(); // documentId -> Set(part)
     const pendingAutoSelect = new Set();
+    const deletingDocuments = new Set();
+    const deletedDocuments = new Set();
     const documentResults = new Map();
     const modelLabels = {};
     let activeDocumentId = "";
     let activePart = "part2";
     const activeTasks = new Map();
+    // 每个“文件 + 部分”都有独立代次。这样重新选择某一部分后，旧任务的晚到
+    // 轮询结果不会把它写回当前报告，同时不会影响同一文件中其它正在运行的部分。
+    const targetRunGenerations = new Map();
     const launchingTargets = new Set(); // 请求已发出、尚未拿到 task_id 的 documentId::part
     // Completed report bodies are expensive to recreate: marked, KaTeX and
     // figure-reference wiring all touch the DOM. Keep one view per paper/part
@@ -84,6 +89,34 @@
       return `${documentId}::${part}`;
     }
 
+    function beginExtractionRun(selectedTargets, runnableTargetsList) {
+      const partsByDocument = new Map();
+      selectedTargets.forEach((target) => {
+        if (!partsByDocument.has(target.documentId)) partsByDocument.set(target.documentId, new Set());
+        partsByDocument.get(target.documentId).add(target.part);
+      });
+      const generations = new Map();
+      partsByDocument.forEach((selectedParts, documentId) => {
+        const result = ensureDocumentResult(documentId, fileById(documentId)?.name || "");
+        Object.keys(PARTS).forEach((part) => {
+          if (selectedParts.has(part)) return;
+          // 使该部分已有任务失效，避免旧轮询在本轮结束后又把未选择的内容写回来。
+          const key = targetKey(documentId, part);
+          targetRunGenerations.set(key, (targetRunGenerations.get(key) || 0) + 1);
+          result.parts[part].effective = null;
+          result.parts[part].latestAttempt = null;
+          reportViewCache.delete(key);
+        });
+      });
+      runnableTargetsList.forEach((target) => {
+        const key = targetKey(target.documentId, target.part);
+        const generation = (targetRunGenerations.get(key) || 0) + 1;
+        targetRunGenerations.set(key, generation);
+        generations.set(key, generation);
+      });
+      return generations;
+    }
+
     function partsForDocument(documentId) {
       let parts = selectedPartsByDocument.get(documentId);
       if (!parts) {
@@ -128,10 +161,14 @@
       return result;
     }
 
-    function mergePaperState(paper, run) {
+    function mergePaperState(paper, run, generation = null) {
       if (!paper) return;
       const documentId = String(paper.document_id || paper.id || "");
       if (!documentId) return;
+      const incomingParts = (run && run.parts) || [];
+      if (generation != null && incomingParts.some((part) =>
+        targetRunGenerations.get(targetKey(documentId, part)) !== generation
+      )) return;
       const result = ensureDocumentResult(documentId, paper.name);
       const runId = String(paper.run_id || (run && run.runId) || "");
       result.runs.set(runId, {
@@ -185,15 +222,32 @@
       return { text: "未开始", className: "" };
     }
 
+    function hasExtractionActivity(result) {
+      if (!result || !result.parts) return false;
+      return Object.values(result.parts).some((state) => Boolean(
+        state && (state.effective || (state.latestAttempt && state.latestAttempt.status !== "not_selected"))
+      ));
+    }
+
     function allResultDocuments() {
       const list = [];
       const seen = new Set();
-      files().forEach((file) => { seen.add(file.id); list.push({ id: file.id, name: file.name }); });
-      documentResults.forEach((result, id) => { if (!seen.has(id)) list.push({ id, name: result.name }); });
+      files().forEach((file) => {
+        const result = documentResults.get(file.id);
+        if (!hasExtractionActivity(result)) return;
+        seen.add(file.id);
+        list.push({ id: file.id, name: file.name });
+      });
+      documentResults.forEach((result, id) => {
+        if (!seen.has(id) && hasExtractionActivity(result)) list.push({ id, name: result.name });
+      });
       return list;
     }
 
     function parseStatusMarkup(file) {
+      if (deletingDocuments.has(file.id) || file.deleting) {
+        return `<span class="mw-parse is-cancelled">${icon("loader-circle")}正在删除</span>`;
+      }
       const status = file.prepareStatus || (file.ready ? "completed" : "processing");
       const elapsed = formatDuration(file.prepareElapsed || 0);
       if (file.ready || status === "completed") return `<span class="mw-parse is-complete">${icon("check")}已完成 · ${elapsed}</span>`;
@@ -213,6 +267,7 @@
       const addFileLabel = el.addFile && el.addFile.querySelector("span");
       if (addFileLabel) addFileLabel.textContent = currentFiles.length ? "继续添加 PDF" : "添加 PDF";
       currentFiles.forEach((file) => {
+        const deleting = deletingDocuments.has(file.id) || Boolean(file.deleting);
         if (!file.ready) selectedDocuments.delete(file.id);
         if (file.ready && pendingAutoSelect.has(file.id)) {
           selectedDocuments.add(file.id);
@@ -220,7 +275,7 @@
         }
         if (["failed", "cancelled"].includes(file.prepareStatus)) pendingAutoSelect.delete(file.id);
         const row = document.createElement("tr");
-        const selectable = Boolean(file.ready);
+        const selectable = Boolean(file.ready) && !deleting;
         const checked = selectedDocuments.has(file.id);
         const selectedParts = partsForDocument(file.id);
         const partButtons = PART_ORDER.map((part) => {
@@ -251,18 +306,29 @@
           });
         });
         const actions = row.querySelector(".mw-actions");
-        if (!file.ready && ["queued", "processing", "cancelling"].includes(file.prepareStatus || "processing")) {
+        if (!file.ready && ["queued", "processing"].includes(file.prepareStatus || "processing") && !deleting) {
           const cancel = document.createElement("button");
           cancel.type = "button"; cancel.className = "mw-action-button mw-primary";
           cancel.innerHTML = `${icon("circle-stop")}<span>取消解析</span>`;
           cancel.addEventListener("click", async () => {
-            if (!file.prepareTaskId) return;
-            file.prepareStatus = "cancelling"; file.prepareStage = "正在取消…"; renderFiles();
-            await fetch("/api/stop_paper_prepare/" + file.prepareTaskId, { method: "POST" }).catch(() => {});
+            try {
+              await bridge.cancelPrepare(file.id);
+            } catch (error) {
+              alert(`取消 PDF 解析失败（${file.name}）：${error.message || error}`);
+            } finally {
+              renderAll();
+            }
           });
           actions.appendChild(cancel);
         }
-        if (!file.ready && ["failed", "cancelled"].includes(file.prepareStatus)) {
+        if (!file.ready && file.prepareStatus === "cancelling" && !deleting) {
+          const cancelling = document.createElement("button");
+          cancelling.type = "button"; cancelling.className = "mw-action-button mw-primary";
+          cancelling.disabled = true;
+          cancelling.innerHTML = `${icon("loader-circle")}<span>正在取消…</span>`;
+          actions.appendChild(cancelling);
+        }
+        if (!file.ready && ["failed", "cancelled"].includes(file.prepareStatus) && !deleting) {
           const retry = document.createElement("button");
           retry.type = "button"; retry.className = "mw-action-button mw-primary";
           retry.innerHTML = `${icon("rotate-cw")}<span>重新解析</span>`;
@@ -270,17 +336,56 @@
         }
         const remove = document.createElement("button");
         remove.type = "button"; remove.className = "mw-action-button mw-danger";
-        remove.innerHTML = `${icon("trash-2")}<span>删除</span>`;
+        remove.disabled = deleting;
+        remove.innerHTML = deleting
+          ? `${icon("loader-circle")}<span>正在删除…</span>`
+          : `${icon("trash-2")}<span>删除</span>`;
         remove.addEventListener("click", async () => {
+          if (deletingDocuments.has(file.id)) return;
+          const wasSelected = selectedDocuments.has(file.id);
+          const previousParts = new Set(selectedPartsByDocument.get(file.id) || []);
+          const wasPendingAutoSelect = pendingAutoSelect.has(file.id);
+          const previousGenerations = new Map();
+          deletingDocuments.add(file.id);
+          deletedDocuments.add(file.id);
           selectedDocuments.delete(file.id);
           selectedPartsByDocument.delete(file.id);
+          pendingAutoSelect.delete(file.id);
           ["part1", "part2", "part3"].forEach((part) => {
+            const key = targetKey(file.id, part);
+            previousGenerations.set(key, targetRunGenerations.get(key) || 0);
+            targetRunGenerations.set(key, (targetRunGenerations.get(key) || 0) + 1);
+            launchingTargets.delete(key);
             const cached = reportViewCache.get(targetKey(file.id, part));
             if (cached?.figurePreview?.destroy) cached.figurePreview.destroy();
             reportViewCache.delete(targetKey(file.id, part));
           });
-          await bridge.removeFile(file.id);
           renderAll();
+          try {
+            const deletion = await bridge.removeFile(file.id);
+            if (!deletion || deletion.ok !== true || (deletion.remaining_pids || []).length) {
+              throw new Error("后端未确认任务进程已经全部退出");
+            }
+            // Only hide task state after the backend has proved that every
+            // worker PID for this document is gone.
+            [...activeTasks.entries()].forEach(([taskId, task]) => {
+              if ((task.targets || []).some((target) => target.documentId === file.id)) {
+                activeTasks.delete(taskId);
+              }
+            });
+            documentResults.delete(file.id);
+            if (activeDocumentId === file.id) activeDocumentId = "";
+          } catch (error) {
+            deletedDocuments.delete(file.id);
+            previousGenerations.forEach((generation, key) => targetRunGenerations.set(key, generation));
+            if (wasSelected) selectedDocuments.add(file.id);
+            if (previousParts.size) selectedPartsByDocument.set(file.id, previousParts);
+            if (wasPendingAutoSelect) pendingAutoSelect.add(file.id);
+            alert(`删除 PDF 失败（${file.name}）：${error.message || error}`);
+          } finally {
+            deletingDocuments.delete(file.id);
+            renderAll();
+          }
         });
         actions.appendChild(remove); el.filesBody.appendChild(row);
       });
@@ -300,12 +405,14 @@
     function renderResults() {
       const documents = allResultDocuments();
       el.resultsCount.textContent = `${documents.length} 个文件`; el.resultList.innerHTML = "";
-      if (!documents.length) { el.resultList.innerHTML = '<div class="mw-empty-note">暂无结果文件</div>'; activeDocumentId = ""; }
+      if (!documents.length) { el.resultList.innerHTML = '<div class="mw-empty-note">暂无已提取文件</div>'; activeDocumentId = ""; }
       else if (!documents.some((item) => item.id === activeDocumentId)) activeDocumentId = documents[0].id;
       documents.forEach((docEntry) => {
         const button = document.createElement("button");
         button.type = "button"; button.className = "mw-result-item" + (docEntry.id === activeDocumentId ? " is-active" : "");
         button.setAttribute("role", "option"); button.setAttribute("aria-selected", String(docEntry.id === activeDocumentId));
+        button.title = docEntry.name;
+        button.setAttribute("aria-label", `打开报告：${docEntry.name}`);
         button.innerHTML = `<span class="mw-result-name">${escapeHtml(docEntry.name)}</span>`;
         button.addEventListener("click", () => { activeDocumentId = docEntry.id; renderResults(); renderDetail(); });
         el.resultList.appendChild(button);
@@ -511,7 +618,7 @@
     }
 
     function fileSignature() {
-      return JSON.stringify(files().map((file) => [file.id, file.ready, file.prepareStatus, file.preparePercent, file.prepareError, file.prepareElapsed, file.prepareTaskId]));
+      return JSON.stringify(files().map((file) => [file.id, file.ready, file.prepareStatus, file.preparePercent, file.prepareError, file.prepareElapsed, file.prepareTaskId, file.deleting]));
     }
 
     function renderAll() {
@@ -543,9 +650,11 @@
       refreshStartButton();
     }
 
-    async function startSingleTarget(target, provider) {
+    async function startSingleTarget(target, provider, generation) {
       const file = fileById(target.documentId);
-      if (!file || !file.ready) throw new Error("选中的文件尚未完成 PDF 解析");
+      if (!file || !file.ready || deletedDocuments.has(target.documentId)) {
+        throw new Error("选中的文件尚未完成 PDF 解析");
+      }
       const key = targetKey(target.documentId, target.part);
       const result = ensureDocumentResult(file.id, file.name);
       launchingTargets.add(key);
@@ -571,11 +680,20 @@
           body: JSON.stringify(payload),
         });
         const data = await response.json().catch(() => ({}));
+        const obsolete = deletedDocuments.has(target.documentId)
+          || !fileById(target.documentId)
+          || targetRunGenerations.get(key) !== generation;
+        if (obsolete && data.task_id) {
+          await fetch("/api/stop_material/" + data.task_id, { method: "POST" }).catch(() => {});
+          return;
+        }
+        if (obsolete) return;
         if (!response.ok || !data.task_id) throw new Error(data.error || "提取任务创建失败");
         const task = {
           taskId: data.task_id,
           runId: data.run_id || data.task_id,
           targets: [{ documentId: target.documentId, part: target.part }],
+          generation,
           provider,
           percent: 0,
           stage: "排队中",
@@ -588,6 +706,9 @@
         activeTasks.set(task.taskId, task);
         void pollTask(task.taskId);
       } catch (error) {
+        if (deletedDocuments.has(target.documentId)
+          || targetRunGenerations.get(key) !== generation
+          || !fileById(target.documentId)) return;
         result.parts[target.part].latestAttempt = {
           ...result.parts[target.part].latestAttempt,
           status: "failed",
@@ -606,10 +727,13 @@
       if (!chosen.length || !targets.length) return;
       if (chosen.some((file) => !file.ready)) { alert("请等待所选 PDF 完成解析后再开始提取。"); return; }
       const provider = el.model.value;
+      const generations = beginExtractionRun(requestedTargets(), targets);
       startPending = true;
       renderAll();
       try {
-        const outcomes = await Promise.allSettled(targets.map((target) => startSingleTarget(target, provider)));
+        const outcomes = await Promise.allSettled(
+          targets.map((target) => startSingleTarget(target, provider, generations.get(targetKey(target.documentId, target.part)))),
+        );
         const failures = outcomes.filter((outcome) => outcome.status === "rejected");
         if (failures.length) {
           lastTaskMessage = `${failures.length} 个独立提取任务启动失败`;
@@ -640,7 +764,7 @@
           provider: data.provider || task.provider,
           parts: data.parts || (task.targets || []).map((target) => target.part),
         };
-        ((data.result && data.result.papers) || []).forEach((paper) => mergePaperState(paper, runInfo));
+        ((data.result && data.result.papers) || []).forEach((paper) => mergePaperState(paper, runInfo, task.generation));
         if (data.done) {
           lastTaskMessage = data.cancelled ? "上次提取已取消" : data.status === "completed" ? "上次提取已完成" : data.status === "partial" ? "上次提取部分完成" : "上次提取失败";
           activeTasks.delete(taskId); scheduleRender(); return;
@@ -659,9 +783,15 @@
         const effective = result.parts[part].effective; markdown += `## ${PARTS[part].exportTitle}\n\n`;
         if (!effective) { markdown += "（未提取）\n\n"; return; }
         markdown += `> 模型：${modelLabel(effective) || "未记录"}　|　耗时：${formatDuration(effective.elapsed)}　|　生成时间：${formatTime(effective.generated_at) || "未记录"}\n\n`;
-        markdown += (part === "part2" ? effective.content : stripLeadingName(effective.content, result.name)) + "\n\n";
+        const sectionMarkdown = part === "part2" ? effective.content : stripLeadingName(effective.content, result.name);
+        markdown += (window.escapeApproximateTildesForMarkdown
+          ? window.escapeApproximateTildesForMarkdown(sectionMarkdown)
+          : sectionMarkdown) + "\n\n";
       });
-      const blob = new Blob([markdown], { type: "text/markdown;charset=utf-8" }); const url = URL.createObjectURL(blob); const link = document.createElement("a");
+      const safeMarkdown = window.clampMarkdownHeadingLevels
+        ? window.clampMarkdownHeadingLevels(markdown)
+        : markdown;
+      const blob = new Blob([safeMarkdown], { type: "text/markdown;charset=utf-8" }); const url = URL.createObjectURL(blob); const link = document.createElement("a");
       const base = result.name.replace(/\.[^.]+$/, "").replace(/[\\/:*?"<>|]/g, "_") || "未命名论文";
       link.href = url; link.download = `${base}_材料信息分析报告.md`; document.body.appendChild(link); link.click(); link.remove(); URL.revokeObjectURL(url);
     }

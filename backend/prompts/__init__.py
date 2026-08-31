@@ -37,7 +37,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from preprocess.clean import CleanResult
+from backend.preprocess.clean import CleanResult
 
 _PROMPT_DIR = Path(__file__).parent
 

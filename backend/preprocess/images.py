@@ -86,8 +86,8 @@ def figure_index_to_image_items(
     document_id: str = "",
 ) -> list[ImageItem]:
     """Resolve temporary/database asset IDs to bytes for one transient VLM call."""
-    from temp_assets import resolve_asset
-    from knowledge_db import knowledge_asset
+    from backend.temp_assets import resolve_asset
+    from backend.knowledge_db import knowledge_asset
 
     items: list[ImageItem] = []
     seen: set[str] = set()

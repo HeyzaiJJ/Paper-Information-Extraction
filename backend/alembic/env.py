@@ -7,11 +7,12 @@ import sys
 from alembic import context
 from sqlalchemy import engine_from_config, pool
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]
+BACKEND_ROOT = ROOT / "backend"
 sys.path.insert(0, str(ROOT))
 
-from knowledge_db import Base  # noqa: E402
-from runtime_config import RUNTIME_CONFIG  # noqa: E402
+from backend.knowledge_db import Base  # noqa: E402
+from backend.runtime_config import RUNTIME_CONFIG  # noqa: E402
 
 
 config = context.config
@@ -20,7 +21,7 @@ if config.config_file_name is not None:
 
 database_url = str(RUNTIME_CONFIG.storage.get("database_url") or "sqlite:///data/marker_web.sqlite3")
 if database_url.startswith("sqlite:///") and not database_url.startswith("sqlite:////"):
-    database_url = "sqlite:///" + str((ROOT / database_url[len("sqlite:///"):]).resolve()).replace("\\", "/")
+    database_url = "sqlite:///" + str((BACKEND_ROOT / database_url[len("sqlite:///"):]).resolve()).replace("\\", "/")
 config.set_main_option("sqlalchemy.url", database_url)
 target_metadata = Base.metadata
 

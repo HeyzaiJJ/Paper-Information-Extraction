@@ -7,10 +7,10 @@
   - 网页端：上传后可逐个删除文件、多选输出格式，转换后在页面内预览、逐卡片右上角下载。
   - 接口端（不带 return_json）：单文件直接下载，多文件打包 zip（兼容 curl / 直接调用）。
 
-运行（PowerShell，项目根目录 E:\\work\\marker）：
+运行（PowerShell，项目根目录）：
     $env:HF_ENDPOINT = "https://hf-mirror.com"
     $env:TORCH_DEVICE = "cuda"
-    .\\.venv\\Scripts\\python.exe marker_platform.py --port 8000
+    .\\.venv\\Scripts\\python.exe -m backend.main --port 8000
 然后浏览器打开 http://127.0.0.1:8000  （接口文档在 /docs）
 """
 
@@ -31,18 +31,20 @@ import threading
 import time
 import uuid
 import zipfile
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from pathlib import Path
 import re
 from typing import List
 from urllib.parse import quote
+
+import psutil
 
 # 与 marker_demo.py / marker_single 一致：仅影响第三方库日志/回退，不改变输出
 os.environ.setdefault("GRPC_VERBOSITY", "ERROR")
 os.environ.setdefault("GLOG_minloglevel", "2")
 os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
-from runtime_config import (
+from backend.runtime_config import (
     RUNTIME_CONFIG,
     apply_runtime_environment,
     check_local_ocr_error,
@@ -51,7 +53,8 @@ from runtime_config import (
     prewarm_local_ocr_error,
     validate_marker_version,
 )
-from logging_setup import (
+from backend.paths import BACKEND_ROOT, FRONTEND_ROOT, REPO_ROOT
+from backend.logging_setup import (
     bind_log_context,
     configure_main_logging,
     configure_worker_logging,
@@ -74,15 +77,16 @@ from marker.config.parser import ConfigParser
 from marker.output import text_from_rendered
 from marker.renderers.json import JSONRenderer
 from marker.renderers.markdown import MarkdownRenderer
-from preprocess.pdf_figures import render_complete_figure_images
-from marker_engine import MarkerEngine, convert_pdf_to_staging
-from temp_assets import (
+from backend.preprocess.pdf_figures import render_complete_figure_images
+from backend.marker_engine import MarkerEngine, convert_pdf_to_staging
+from backend.temp_assets import (
     EXPORT_DIR,
     UPLOAD_DIR,
     build_export_zip,
     cleanup_expired,
     create_document_dir,
     create_manifest,
+    delete_document_dir,
     document_dir,
     persist_figure_index_images,
     persist_json_image_data,
@@ -92,7 +96,7 @@ from temp_assets import (
     sha256_file,
     write_json,
 )
-from knowledge_db import (
+from backend.knowledge_db import (
     ArchiveConflict,
     archive_document,
     create_folder,
@@ -129,8 +133,8 @@ _StarletteRequest._get_form = _get_form_patched
 MODELS = {}                       # 转换模型字典：主进程不再常驻，由转换子进程首次调用 _convert 时加载
 TASKS: dict = {}                  # 异步转换任务表：task_id -> 进度/结果（含 proc/q 供取消）
 _MP_CTX = None                    # spawn 多进程上下文（惰性创建）
-_CONVERSION_SLOTS_PROC = None     # 跨进程三并发槽位：普通转换和论文预处理共用
-_ASYNC_CONVERSION_SLOTS = None    # 主进程有界 worker 池：避免为排队 PDF 提前创建进程
+_CONVERSION_SLOTS_PROC = None     # 仅供旧同步转换调用；可取消任务不得在子进程中持有
+_ASYNC_CONVERSION_SLOTS = None    # 主进程有界 worker 池：强杀 worker 后仍能可靠释放
 
 
 def _mp():
@@ -142,10 +146,10 @@ def _mp():
 
 
 def _get_conversion_slots():
-    """最多允许三篇 PDF 同时进入 Marker。
+    """旧同步转换接口使用的跨进程槽位。
 
-    Marker 2 的布局/OCR模型是远程轻客户端，本地不再需要 GPU 互斥锁。该共享
-    BoundedSemaphore 同时覆盖普通转换区和信息提取区。
+    可取消的转换/论文预处理任务使用主进程 asyncio.Semaphore，不能让可能被
+    terminate/kill 的子进程持有信号量，否则强杀会永久泄漏槽位。
     """
     global _CONVERSION_SLOTS_PROC
     if _CONVERSION_SLOTS_PROC is None:
@@ -162,16 +166,16 @@ def _get_async_conversion_slots():
     return _ASYNC_CONVERSION_SLOTS
 
 
-# ============ marker 配置（config/marker_config.json）============
+# ============ marker 配置（backend/config/marker_config.json）============
 # 集中管理 marker 可调参数（batch_size、是否提图、语言、页数等）。
 # JSON 里值为 null 的键表示“用 marker 库默认”，加载时自动跳过，不会覆盖库默认。
-MARKER_CONFIG_PATH = Path(__file__).parent / "config" / "marker_config.json"
+MARKER_CONFIG_PATH = BACKEND_ROOT / "config" / "marker_config.json"
 
 
 def _load_marker_config(override_path: str | None = None) -> dict:
     """加载 marker 配置 JSON，返回“非 null 键”的字典。
 
-    - 默认读 config/marker_config.json（若存在）。
+    - 默认读 backend/config/marker_config.json（若存在）。
     - override_path 非空时优先读该路径（单次请求覆盖全局默认）。
     - 值为 null 的键被丢弃，避免把 marker 的库默认覆盖成 None。
     返回的字典可直接合并进 _convert 的 kwargs（接口显式参数再覆盖它）。
@@ -327,10 +331,11 @@ async def request_logging_middleware(request: Request, call_next):
     finally:
         reset_log_context(token)
 
-# 前端资源：模板与静态文件（路径基于本文件所在目录，避免依赖启动 cwd）
-BASE_DIR = Path(__file__).parent
-templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
-app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
+# 前端资源：模板与静态文件（路径基于仓库根目录，避免依赖启动 cwd）
+BASE_DIR = BACKEND_ROOT
+FRONTEND_DIR = FRONTEND_ROOT
+templates = Jinja2Templates(directory=str(FRONTEND_DIR))
+app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static")
 
 
 # ============ 图片内联：把 images 字典编码成 base64 塞进文本 ============
@@ -568,10 +573,10 @@ def _convert_markdown_and_json_once(
     return markdown, internal_json
 
 
-# ============ 网页上传界面（模板在 templates/index.html，静态资源在 static/）============
+# ============ 网页上传界面（资源均在 frontend/）============
 @app.get("/")
 async def index(request: Request):
-    return templates.TemplateResponse(
+    response = templates.TemplateResponse(
         request,
         "index.html",
         {
@@ -579,6 +584,10 @@ async def index(request: Request):
             "formats": ["markdown", "json", "html"],
         },
     )
+    # The task-lifecycle client and backend must stay in lockstep. Always
+    # revalidate the HTML so a normal reload picks up the latest cache-buster.
+    response.headers["Cache-Control"] = "no-store, must-revalidate"
+    return response
 
 
 # ============ 上传转换接口 ============
@@ -597,7 +606,7 @@ async def convert(
     use_openai: bool = Form(False),
     openai_key: str = Form(""),
     return_json: bool = Form(False),
-    marker_config: str = Form("", description="可选：marker 配置 JSON 路径，覆盖 config/marker_config.json"),
+    marker_config: str = Form("", description="可选：marker 配置 JSON 路径，覆盖 backend/config/marker_config.json"),
 ):
     return JSONResponse(
         {"error": "旧转换接口已停用；请使用 /api/conversion/batch 获取 Markdown+图片 ZIP。"},
@@ -748,7 +757,7 @@ def _convert_task_worker(
     t = threading.Thread(target=_creep, daemon=True)
     t.start()
     try:
-        with conversion_slots:
+        with (conversion_slots if conversion_slots is not None else nullcontext()):
             total = max(1, len(items) * len(fmts))
             unit = 0
             any_failed = False
@@ -877,7 +886,7 @@ async def convert_async(
     google_key: str = Form(""),
     use_openai: bool = Form(False),
     openai_key: str = Form(""),
-    marker_config: str = Form("", description="可选：marker 配置 JSON 路径，覆盖 config/marker_config.json"),
+    marker_config: str = Form("", description="可选：marker 配置 JSON 路径，覆盖 backend/config/marker_config.json"),
 ):
     """提交转换任务，立即返回 task_id；用 GET /progress/{task_id} 轮询进度和结果。"""
     return JSONResponse(
@@ -1005,7 +1014,7 @@ def _conversion_document_worker(
     worker_logger.info("文档转换 worker 启动")
     try:
         q.put(("queued", "等待转换槽位"))
-        with conversion_slots:
+        with (conversion_slots if conversion_slots is not None else nullcontext()):
             q.put(("stage", "正在启动 Marker 2.0", 3.0))
 
             def progress(stage: str, percent: float):
@@ -1071,7 +1080,7 @@ async def _run_conversion_document(task_id: str, item: dict):
             item["doc_dir"],
             task.get("marker_options") or {},
             q,
-            _get_conversion_slots(),
+            None,  # 主进程已持有 async_slots；子进程不得持有可泄漏的信号量
             get_log_queue(),
             task.get("request_id", ""),
         ),
@@ -1368,7 +1377,7 @@ async def conversion_download(task_id: str):
 @app.post("/api/convert_md")
 async def convert_md(
     files: List[UploadFile] = File(..., description="PDF 文件，可多选"),
-    marker_config: str = Form("", description="可选：marker 配置 JSON 路径，覆盖 config/marker_config.json"),
+    marker_config: str = Form("", description="可选：marker 配置 JSON 路径，覆盖 backend/config/marker_config.json"),
     prepare_for_analysis: bool = Form(False),
 ):
     """把上传的 PDF 转成 Markdown。
@@ -1946,7 +1955,7 @@ def _paper_prepare_worker(
     worker_logger = logging.getLogger("paper.worker.paper_prepare")
     worker_logger.info("论文预处理 worker 启动")
     try:
-        with conversion_slots:
+        with (conversion_slots if conversion_slots is not None else nullcontext()):
             def report(stage: str, percent: float) -> None:
                 q.put(("stage", stage))
                 q.put(("percent", percent))
@@ -2104,6 +2113,359 @@ def _prune_paper_prep_tasks():
     ]
     for tid in stale:
         PAPER_PREP_TASKS.pop(tid, None)
+    _prune_workspace_tombstones(now)
+
+
+def _prune_workspace_tombstones(now: float | None = None) -> None:
+    now = now or time.time()
+    for registry in (CANCELLED_PAPER_PREP_IDS, DELETED_WORKSPACE_DOCUMENTS):
+        for key, created in list(registry.items()):
+            if now - created > 3600:
+                registry.pop(key, None)
+
+
+def _process_is_alive(proc) -> bool:
+    if proc is None:
+        return False
+    try:
+        return bool(proc.is_alive())
+    except (AssertionError, ValueError):
+        return False
+
+
+def _record_task_process_identity(task: dict) -> None:
+    """Record PID + create_time immediately after spawn to prevent PID-reuse kills."""
+    proc = task.get("proc")
+    pid = getattr(proc, "pid", None) if proc is not None else None
+    if not pid:
+        return
+    task["process_pid"] = int(pid)
+    try:
+        task["process_create_time"] = float(psutil.Process(pid).create_time())
+        task.setdefault("process_tree_identities", {})[int(pid)] = task["process_create_time"]
+    except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+        # The multiprocessing handle remains the source of truth when a worker
+        # exits between start() and identity capture.
+        task["process_create_time"] = None
+
+
+def _snapshot_task_process_tree(task: dict) -> None:
+    """Remember descendants while the root is alive for orphan cleanup later."""
+    pid = task.get("process_pid") or getattr(task.get("proc"), "pid", None)
+    if not pid:
+        return
+    try:
+        root = psutil.Process(int(pid))
+        expected = task.get("process_create_time")
+        if expected is not None and not _same_process(root, float(expected)):
+            return
+        identities = task.setdefault("process_tree_identities", {})
+        identities[int(pid)] = root.create_time()
+        for child in root.children(recursive=True):
+            try:
+                identities[int(child.pid)] = child.create_time()
+            except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+                pass
+    except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+        pass
+
+def _same_process(process: psutil.Process, create_time: float | None) -> bool:
+    try:
+        if not process.is_running() or process.status() == psutil.STATUS_ZOMBIE:
+            return False
+        return create_time is None or abs(process.create_time() - create_time) < 0.01
+    except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+        return False
+
+
+def _terminate_process_tree_sync(task: dict) -> dict:
+    """Terminate a tracked worker and every descendant, then verify they are gone."""
+    proc = task.get("proc")
+    pid = task.get("process_pid") or getattr(proc, "pid", None)
+    create_time = task.get("process_create_time")
+    errors: list[str] = []
+
+    # Test doubles and a process that failed before start() have no PID. Keep a
+    # multiprocessing-handle fallback, but never claim success while it is alive.
+    if not pid:
+        if _process_is_alive(proc):
+            try:
+                proc.terminate()
+            except Exception as exc:
+                errors.append(f"terminate: {exc}")
+            try:
+                proc.join(1.0)
+            except Exception:
+                pass
+        if _process_is_alive(proc):
+            try:
+                proc.kill()
+                proc.join(3.0)
+            except Exception as exc:
+                errors.append(f"kill: {exc}")
+        alive = _process_is_alive(proc)
+        return {
+            "terminated_pids": [],
+            "remaining_pids": [],
+            "process_alive": alive,
+            "errors": errors,
+        }
+
+    pid = int(pid)
+    known_identities = {
+        int(known_pid): float(known_time)
+        for known_pid, known_time in (task.get("process_tree_identities") or {}).items()
+        if known_time is not None
+    }
+    if create_time is not None:
+        known_identities[pid] = float(create_time)
+
+    try:
+        root = psutil.Process(pid)
+    except (psutil.NoSuchProcess, OSError):
+        root = None
+
+    if root is not None and create_time is not None and not _same_process(root, float(create_time)):
+        # Never kill an unrelated process that inherited a recycled PID.
+        alive = _process_is_alive(proc)
+        if alive:
+            errors.append(f"PID {pid} identity mismatch")
+        return {
+            "terminated_pids": [],
+            "remaining_pids": [pid] if alive else [],
+            "process_alive": alive,
+            "errors": errors,
+        }
+
+    # Suspend the root before enumerating children so it cannot create a new
+    # descendant between the snapshot and termination.
+    descendants: list[psutil.Process] = []
+    if root is not None:
+        try:
+            root.suspend()
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError) as exc:
+            if not isinstance(exc, psutil.NoSuchProcess):
+                errors.append(f"suspend {pid}: {exc}")
+        try:
+            descendants = root.children(recursive=True)
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError) as exc:
+            if not isinstance(exc, psutil.NoSuchProcess):
+                errors.append(f"enumerate children {pid}: {exc}")
+    else:
+        # The root may have exited while a descendant survived. Use the last
+        # safely captured PID/create-time pairs to remove those orphans.
+        for known_pid, known_time in known_identities.items():
+            try:
+                candidate = psutil.Process(known_pid)
+                if _same_process(candidate, known_time):
+                    descendants.append(candidate)
+            except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+                pass
+
+    targets: list[psutil.Process] = []
+    seen: set[int] = set()
+    for process in [*descendants, root] if root is not None else descendants:
+        if process is not None and process.pid not in seen:
+            seen.add(process.pid)
+            targets.append(process)
+    # Include descendants seen by the consumer before the root disappeared.
+    for known_pid, known_time in known_identities.items():
+        if known_pid in seen:
+            continue
+        try:
+            candidate = psutil.Process(known_pid)
+            if _same_process(candidate, known_time):
+                seen.add(known_pid)
+                targets.append(candidate)
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+            pass
+
+    identities: dict[int, float | None] = {}
+    for process in targets:
+        try:
+            identities[process.pid] = known_identities.get(process.pid, process.create_time())
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+            identities[process.pid] = None
+
+    # Children first, then the suspended root. A short graceful phase permits
+    # native libraries to unwind; kill() is the hard deadline.
+    for process in targets:
+        try:
+            process.terminate()
+        except psutil.NoSuchProcess:
+            pass
+        except (psutil.AccessDenied, OSError) as exc:
+            errors.append(f"terminate {process.pid}: {exc}")
+    _, alive = psutil.wait_procs(targets, timeout=1.0)
+    for process in alive:
+        try:
+            process.kill()
+        except psutil.NoSuchProcess:
+            pass
+        except (psutil.AccessDenied, OSError) as exc:
+            errors.append(f"kill {process.pid}: {exc}")
+    if alive:
+        psutil.wait_procs(alive, timeout=3.0)
+
+    remaining_pids = sorted(
+        process.pid
+        for process in targets
+        if _same_process(process, identities.get(process.pid))
+    )
+    terminated_pids = sorted(set(identities) - set(remaining_pids))
+    try:
+        proc.join(0.5)
+    except Exception:
+        pass
+    process_alive = _process_is_alive(proc)
+    if process_alive and pid not in remaining_pids:
+        remaining_pids.append(pid)
+        remaining_pids.sort()
+    return {
+        "terminated_pids": terminated_pids,
+        "remaining_pids": remaining_pids,
+        "process_alive": process_alive,
+        "errors": errors,
+    }
+
+
+async def _terminate_task_process(task: dict) -> dict:
+    """Wait for an in-flight spawn, kill its full tree, and return proof."""
+    lock = task.get("termination_lock")
+    if lock is None:
+        lock = asyncio.Lock()
+        task["termination_lock"] = lock
+    async with lock:
+        previous = task.get("termination_result")
+        if (
+            previous
+            and not previous.get("remaining_pids")
+            and not previous.get("process_alive")
+            and not _process_is_alive(task.get("proc"))
+        ):
+            return previous
+        starter = task.get("start_future")
+        if starter is not None and not starter.done():
+            try:
+                await asyncio.shield(starter)
+            except Exception as exc:
+                logger.warning(
+                    "等待 worker 启动完成失败 error=%s", str(exc)[:200],
+                    extra={"task_id": task.get("task_id", "")},
+                )
+        _record_task_process_identity(task)
+        started = time.monotonic()
+        result = await asyncio.to_thread(_terminate_process_tree_sync, task)
+        result["elapsed_ms"] = round((time.monotonic() - started) * 1000, 1)
+        task["termination_result"] = result
+        log = logger.error if result["remaining_pids"] or result["process_alive"] else logger.info
+        log(
+            "worker 进程树终止结果 terminated=%s remaining=%s elapsed_ms=%.1f errors=%s",
+            result["terminated_pids"], result["remaining_pids"], result["elapsed_ms"],
+            result["errors"],
+            extra={"request_id": task.get("request_id", ""),
+                   "task_id": task.get("task_id", ""),
+                   "document_id": task.get("document_id", "")},
+        )
+        return result
+
+
+def _close_task_queue(task: dict) -> None:
+    if task.get("queue_closed"):
+        return
+    q = task.get("q")
+    if q is not None:
+        try:
+            q.close()
+        except (OSError, ValueError):
+            pass
+        try:
+            q.cancel_join_thread()
+        except (AttributeError, OSError, ValueError):
+            pass
+    task["queue_closed"] = True
+
+
+async def _wait_for_task_finalization(task: dict, timeout: float = 3.0) -> None:
+    consumer = task.get("consumer")
+    if consumer is asyncio.current_task():
+        return
+    if consumer is not None and not consumer.done():
+        try:
+            await asyncio.wait_for(asyncio.shield(consumer), timeout=timeout)
+        except asyncio.TimeoutError:
+            _close_task_queue(task)
+            consumer.cancel()
+            try:
+                await consumer
+            except asyncio.CancelledError:
+                pass
+        except asyncio.CancelledError:
+            pass
+
+
+async def _cancel_paper_prepare_task(task_id: str) -> dict:
+    """Idempotently cancel one preparation run, including pre-registration races."""
+    CANCELLED_PAPER_PREP_IDS[task_id] = time.time()
+    task = PAPER_PREP_TASKS.get(task_id)
+    if task is None:
+        return {
+            "ok": True, "pending": True,
+            "terminated_pids": [], "remaining_pids": [],
+        }
+    if task.get("done"):
+        termination = await _terminate_task_process(task)
+        if termination.get("remaining_pids") or termination.get("process_alive"):
+            return {
+                "ok": False, "cancelled": False,
+                "error": "已结束的解析任务仍有残留进程",
+                "terminated_pids": termination.get("terminated_pids", []),
+                "remaining_pids": termination.get("remaining_pids", []),
+            }
+        _close_task_queue(task)
+        await _wait_for_task_finalization(task)
+        return {
+            "ok": True, "already_done": True,
+            "cancelled": bool(task.get("cancelled")),
+            "terminated_pids": termination.get("terminated_pids", []),
+            "remaining_pids": termination.get("remaining_pids", []),
+        }
+    task["cancel"] = True
+    task["stage"] = "正在取消…"
+    cancel_event = task.get("cancel_event")
+    if cancel_event is not None:
+        cancel_event.set()
+    termination = await _terminate_task_process(task)
+    if termination["remaining_pids"] or termination["process_alive"]:
+        task["stage"] = "进程终止失败"
+        return {
+            "ok": False, "cancelled": False,
+            "error": "PDF 解析进程未能完全退出",
+            "terminated_pids": termination["terminated_pids"],
+            "remaining_pids": termination["remaining_pids"],
+        }
+    _close_task_queue(task)
+    await _wait_for_task_finalization(task)
+    if not task.get("done"):
+        task.update({
+            "cancelled": True, "done": True, "success": False,
+            "stage": "已取消", "result": {},
+        })
+    document_id = str(task.get("document_id") or "")
+    if document_id:
+        try:
+            await asyncio.to_thread(delete_document_dir, document_id)
+        except OSError:
+            logger.warning(
+                "取消解析后清理临时文档失败",
+                extra={"task_id": task_id, "document_id": document_id},
+                exc_info=True,
+            )
+    return {
+        "ok": True, "stopped": True, "cancelled": True,
+        "terminated_pids": termination["terminated_pids"],
+        "remaining_pids": [],
+    }
 
 
 async def _consume_paper_prep_task(task_id: str):
@@ -2111,6 +2473,7 @@ async def _consume_paper_prep_task(task_id: str):
     proc, q = task.get("proc"), task.get("q")
     try:
         while True:
+            _snapshot_task_process_tree(task)
             try:
                 msg = await asyncio.to_thread(q.get, True, 0.5)
             except queue.Empty:
@@ -2126,6 +2489,10 @@ async def _consume_paper_prep_task(task_id: str):
                 )
                 break
             kind = msg[0]
+            # Cancellation wins over queued worker messages, including a late
+            # successful completion that had not yet been consumed.
+            if task.get("cancel"):
+                break
             if kind == "stage":
                 task["stage"] = msg[1]
             elif kind == "percent":
@@ -2159,8 +2526,10 @@ async def _consume_paper_prep_task(task_id: str):
                 await asyncio.to_thread(proc.join, 2)
             except Exception:
                 pass
-        if task.get("cancel") and not task.get("done"):
+        if task.get("cancel"):
             task["cancelled"] = True
+            task["success"] = False
+            task["result"] = {}
             task["stage"] = "已取消"
             task["done"] = True
         elif not task.get("done"):
@@ -2177,10 +2546,115 @@ async def _consume_paper_prep_task(task_id: str):
             os.remove(task["_pdf_path"])
         except OSError:
             pass
+        if task.get("cancel"):
+            try:
+                await asyncio.to_thread(delete_document_dir, task.get("document_id", ""))
+            except OSError:
+                logger.warning(
+                    "取消解析后清理临时文档失败",
+                    extra={"request_id": task.get("request_id", ""),
+                           "task_id": task_id, "document_id": task.get("document_id", "")},
+                    exc_info=True,
+                )
+        _close_task_queue(task)
+
+
+async def _acquire_conversion_slot_or_cancel(task: dict) -> bool:
+    """Wait in the parent process without leaking a slot when cancellation wins."""
+    slots = _get_async_conversion_slots()
+    cancel_event = task["cancel_event"]
+    acquire_task = asyncio.create_task(slots.acquire())
+    cancel_task = asyncio.create_task(cancel_event.wait())
+    try:
+        done, _ = await asyncio.wait(
+            {acquire_task, cancel_task}, return_when=asyncio.FIRST_COMPLETED,
+        )
+        if acquire_task in done:
+            if cancel_event.is_set() or task.get("cancel"):
+                slots.release()
+                return False
+            return True
+        acquire_task.cancel()
         try:
-            q.close()
-        except Exception:
+            await acquire_task
+        except asyncio.CancelledError:
             pass
+        else:
+            # The slot became available in the tiny window between wait() and
+            # cancel(); return that successfully acquired permit immediately.
+            slots.release()
+        return False
+    finally:
+        if not cancel_task.done():
+            cancel_task.cancel()
+        try:
+            await cancel_task
+        except asyncio.CancelledError:
+            pass
+
+
+async def _run_paper_prepare_task(task_id: str) -> None:
+    """Own the preparation slot in the parent and supervise the worker lifecycle."""
+    task = PAPER_PREP_TASKS.get(task_id)
+    if task is None:
+        return
+    slot_acquired = False
+    process_started = False
+    try:
+        slot_acquired = await _acquire_conversion_slot_or_cancel(task)
+        if not slot_acquired or task.get("cancel"):
+            task.update({
+                "cancelled": True, "done": True, "success": False,
+                "stage": "已取消", "result": {},
+            })
+            return
+
+        task["stage"] = "正在启动解析进程"
+        starter = asyncio.create_task(asyncio.to_thread(task["proc"].start))
+        task["start_future"] = starter
+        await asyncio.shield(starter)
+        process_started = True
+        task["process_started"] = True
+        _record_task_process_identity(task)
+
+        # Cancellation can arrive while Windows spawn() is in progress. Both
+        # paths share the same termination lock, so the tree is killed once.
+        if task.get("cancel"):
+            await _terminate_task_process(task)
+            _close_task_queue(task)
+        await _consume_paper_prep_task(task_id)
+    except Exception as exc:
+        logger.exception(
+            "论文预处理进程启动或监管失败",
+            extra={"request_id": task.get("request_id", ""),
+                   "task_id": task_id, "document_id": task.get("document_id", "")},
+        )
+        if process_started and _process_is_alive(task.get("proc")):
+            await _terminate_task_process(task)
+        task.update({
+            "error": str(exc), "stage": "失败", "done": True, "success": False,
+        })
+    finally:
+        if slot_acquired:
+            _get_async_conversion_slots().release()
+        if not process_started:
+            pdf_path = str(task.get("_pdf_path") or "")
+            if pdf_path:
+                try:
+                    Path(pdf_path).unlink(missing_ok=True)
+                except OSError:
+                    pass
+            if task.get("cancel"):
+                try:
+                    await asyncio.to_thread(delete_document_dir, task.get("document_id", ""))
+                except (OSError, ValueError):
+                    logger.warning(
+                        "取消排队解析后清理临时文档失败",
+                        extra={"task_id": task_id,
+                               "document_id": task.get("document_id", "")},
+                        exc_info=True,
+                    )
+            _close_task_queue(task)
 
 
 @app.post("/api/prepare_paper")
@@ -2193,58 +2667,84 @@ async def prepare_paper(
         description="可选：首次转换得到的 Markdown 文件；优先于 markdown 表单字段",
     ),
     marker_config: str = Form(""),
+    prepare_task_id: str = Form(""),
+    client_document_id: str = Form(""),
 ):
     """异步构建共享论文记录；Markdown 与 JSON 强制来自同一 Marker Document。"""
     if not (file.filename or "").lower().endswith(".pdf"):
         return JSONResponse({"error": "仅支持 PDF 文件"}, status_code=400)
+    _prune_paper_prep_tasks()
+    task_id = str(prepare_task_id or "").strip() or uuid.uuid4().hex
+    client_document_id = str(client_document_id or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{8,128}", task_id):
+        return JSONResponse({"error": "非法解析任务 ID"}, status_code=400)
+    if client_document_id and not re.fullmatch(r"[A-Za-z0-9_-]{3,160}", client_document_id):
+        return JSONResponse({"error": "非法工作区文档 ID"}, status_code=400)
+    if task_id in PAPER_PREP_TASKS:
+        return JSONResponse({"error": "解析任务 ID 已存在"}, status_code=409)
+    if task_id in CANCELLED_PAPER_PREP_IDS or client_document_id in DELETED_WORKSPACE_DOCUMENTS:
+        return JSONResponse({"error": "PDF 解析已取消", "cancelled": True}, status_code=409)
+
+    # A retry is a genuinely new run. The old process tree must be gone before
+    # a replacement task can allocate a new staging directory.
+    previous_task_ids = [
+        previous_id for previous_id, previous in PAPER_PREP_TASKS.items()
+        if client_document_id
+        and previous_id != task_id
+        and previous.get("client_document_id") == client_document_id
+    ]
+    for previous_id in previous_task_ids:
+        previous = PAPER_PREP_TASKS.get(previous_id)
+        if previous and not previous.get("done"):
+            cancelled = await _cancel_paper_prepare_task(previous_id)
+            if not cancelled.get("ok"):
+                return JSONResponse(cancelled, status_code=500)
+        previous_document_id = str((previous or {}).get("document_id") or "")
+        if previous_document_id:
+            await asyncio.to_thread(delete_document_dir, previous_document_id)
+        PAPER_PREP_TASKS.pop(previous_id, None)
+
     if markdown_file is not None:
         try:
             markdown = (await markdown_file.read()).decode("utf-8")
         except UnicodeDecodeError:
             return JSONResponse({"error": "Markdown 文件必须使用 UTF-8 编码"}, status_code=400)
-    _prune_paper_prep_tasks()
-    task_id = uuid.uuid4().hex
+    pdf_content = await file.read()
+    if task_id in CANCELLED_PAPER_PREP_IDS or client_document_id in DELETED_WORKSPACE_DOCUMENTS:
+        return JSONResponse({"error": "PDF 解析已取消", "cancelled": True}, status_code=409)
+
     document_id, doc_dir_path = create_document_dir(task_id)
     source_pdf = doc_dir_path / "source.pdf"
-    source_pdf.write_bytes(await file.read())
+    source_pdf.write_bytes(pdf_content)
     ctx = _mp()
     q = ctx.Queue()
     proc = ctx.Process(
         target=_paper_prepare_worker,
         args=(
             str(source_pdf), file.filename, task_id, document_id, str(doc_dir_path),
-            _load_marker_config(marker_config or None), q, _get_conversion_slots(),
+            _load_marker_config(marker_config or None), q, None,
             get_log_queue(), getattr(request.state, "request_id", ""),
         ),
         daemon=True,
     )
-    PAPER_PREP_TASKS[task_id] = {
+    task = {
+        "task_id": task_id,
         "created": time.time(), "percent": 0.0, "stage": "排队中", "done": False,
         "success": False, "error": "", "result": {}, "proc": proc, "q": q,
         "document_id": document_id, "_pdf_path": str(source_pdf),
+        "client_document_id": client_document_id,
         "request_id": getattr(request.state, "request_id", ""),
+        "cancel": False, "cancel_event": asyncio.Event(),
+        "process_started": False,
     }
+    PAPER_PREP_TASKS[task_id] = task
     logger.info(
         "提交论文预处理任务",
-        extra={"request_id": getattr(request.state, "request_id", ""),
+        extra={"request_id": task["request_id"],
                "task_id": task_id, "document_id": document_id},
     )
-    try:
-        await asyncio.to_thread(proc.start)
-    except Exception as exc:
-        logger.exception(
-            "论文预处理进程启动失败",
-            extra={"request_id": getattr(request.state, "request_id", ""),
-                   "task_id": task_id, "document_id": document_id},
-        )
-        PAPER_PREP_TASKS.pop(task_id, None)
-        Path(source_pdf).unlink(missing_ok=True)
-        try:
-            q.close()
-        except Exception:
-            pass
-        return JSONResponse({"error": f"提取进程启动失败：{exc}"}, status_code=500)
-    asyncio.create_task(_consume_paper_prep_task(task_id))
+    consumer = asyncio.create_task(_run_paper_prepare_task(task_id))
+    task["consumer"] = consumer
     return JSONResponse({"task_id": task_id, "document_id": document_id})
 
 
@@ -2256,58 +2756,40 @@ async def paper_prepare_progress(task_id: str):
     return JSONResponse({
         "percent": round(task["percent"], 1), "stage": task["stage"], "done": task["done"],
         "success": task["success"], "error": task["error"],
-        "cancelled": bool(task.get("cancel", False)),
+        "cancelling": bool(task.get("cancel") and not task.get("done")),
+        "cancelled": bool(task.get("cancelled", False)),
         "result": task["result"] if task["done"] else {},
     })
 
 
 @app.post("/api/stop_paper_prepare/{task_id}")
 async def stop_paper_prepare(task_id: str):
-    """立即停止“加入提取工作区”时的 PDF 预处理，并由消费协程清理临时 PDF。"""
+    """立即停止 PDF 预处理；未知 ID 也会登记，覆盖上传中的竞态。"""
     task = PAPER_PREP_TASKS.get(task_id)
-    if task is None:
-        return JSONResponse({"error": "任务不存在或已过期"}, status_code=404)
-    if task.get("done"):
-        return JSONResponse({"ok": True, "already_done": True})
-    task["cancel"] = True
-    task["stage"] = "正在取消…"
     logger.info(
         "请求取消论文预处理",
-        extra={"request_id": task.get("request_id", ""), "task_id": task_id,
-               "document_id": task.get("document_id", "")},
+        extra={"request_id": (task or {}).get("request_id", ""), "task_id": task_id,
+               "document_id": (task or {}).get("document_id", "")},
     )
-    proc = task.get("proc")
-    if proc is not None and proc.is_alive():
-        proc.terminate()
-        try:
-            await asyncio.to_thread(proc.join, 5)
-        except Exception:
-            pass
-        if proc.is_alive():
-            try:
-                proc.kill()
-                await asyncio.to_thread(proc.join, 2)
-            except Exception:
-                pass
-    task["cancelled"] = True
-    return JSONResponse({"ok": True, "stopped": True})
+    result = await _cancel_paper_prepare_task(task_id)
+    return JSONResponse(result, status_code=200 if result.get("ok") else 500)
 
 
 
 # ============ 材料分析 API：模块一 part1=摘要与结论总结(summarize)；模块二+三 part2/part3=材料提取+全文结论，自适应合并为一次全文调用（超长自动拆分） ============
 import sys as _sys
-_sys.path.insert(0, str(BASE_DIR))  # 确保 import summarize / preprocess 可解析
+_sys.path.insert(0, str(REPO_ROOT))  # 兼容 worker 子进程的包导入
 
-from preprocess.clean import preprocess  # noqa: E402
-from preprocess.images import (  # noqa: E402
+from backend.preprocess.clean import preprocess  # noqa: E402
+from backend.markdown_utils import escape_approximate_tildes  # noqa: E402
+from backend.preprocess.images import (  # noqa: E402
     figure_index_to_image_items,
 )
-from vision import analyze_images as run_vision_analysis  # noqa: E402
-from summarize import summarize_from_clean  # noqa: E402
+from backend.vision import analyze_images as run_vision_analysis  # noqa: E402
+from backend.summarize import summarize_from_clean  # noqa: E402
 # 材料提取模块：与摘要模块（summarize）完全独立，互不 import，仅共用 preprocess / ai_client
-from extract import (  # noqa: E402
+from backend.extract import (  # noqa: E402
     extract_from_clean_markdown,
-    escape_approximate_tildes,
     normalize_list_indentation,
     inject_figure_images,
     _strip_code_fence as _strip_fence,
@@ -2316,18 +2798,20 @@ from extract import (  # noqa: E402
     _MAX_TOKENS_BY_CATEGORY as _EXT_TOKENS,
 )
 # 全文综合结论模块：与摘要/提取独立，复用 master 提示词（mode=conclusion）
-from conclusion import (  # noqa: E402
+from backend.conclusion import (  # noqa: E402
     conclude_from_clean_markdown,
     CONCLUDE_TEMPERATURE,
     _MAX_TOKENS_BY_CATEGORY as _CONCL_TOKENS,
 )
 # 提示词（master + 自适应合并入口）：extract+conclusion 合并为一次全文调用
-from prompts import build_extract_conclusion_calls  # noqa: E402
+from backend.prompts import build_extract_conclusion_calls  # noqa: E402
 # AI 调用基础设施
-from ai_client import get_model_config, create_client, chat, list_providers, get_vision_config  # noqa: E402
+from backend.ai_client import get_model_config, create_client, chat, list_providers, get_vision_config  # noqa: E402
 
 MATERIAL_TASKS: dict = {}               # 材料提取任务表：task_id -> 进度/结果
 PAPER_PREP_TASKS: dict = {}             # PDF -> Markdown + FigureIndex 预处理任务表
+CANCELLED_PAPER_PREP_IDS: dict[str, float] = {}  # 覆盖“上传中、任务尚未登记”的取消竞态
+DELETED_WORKSPACE_DOCUMENTS: dict[str, float] = {}  # 阻止已删除文档的晚到提取请求
 
 _MATERIAL_PARTS = ("part1", "part2", "part3")
 
@@ -2405,6 +2889,16 @@ def _refresh_material_paper_status(paper: dict, selected_parts) -> str:
 def _set_material_part(paper: dict, part: str, *, status: str, content: str = "",
                        error: str = "", provider: str = "", model_label: str = "",
                        elapsed: int = 0, generated_at: str = "", run_id: str = ""):
+    # 所有结果入口统一在写入状态前做最终清理。模型即使使用了 mode=extract，
+    # 也可能在材料条目后继续输出“全文综合结论/未来研究建议”；这里是独立
+    # 调用、合并调用回退和其它调用方共同经过的最后一道边界保护。
+    if status == "completed":
+        if part == "part2":
+            # Module callers already normalize heading depth before publishing;
+            # the final write-path cleanup must not downgrade it a second time.
+            content = _normalize_material_output(content, downgrade_headings=False)
+        elif part == "part3":
+            content = _normalize_conclusion_output(content)
     state = paper["parts"][part]
     state.update({
         "status": status,
@@ -2422,9 +2916,44 @@ def _set_material_part(paper: dict, part: str, *, status: str, content: str = ""
 
 # ============ 模块二+三 自适应合并：材料提取 + 全文结论（全文只读一次）============
 
-# 合并输出拆分锚点：结论部分用一级标题「# 一、全文综合结论」，提取部分用二级标题，
-# 层级不同，可作为两部分之间唯一、稳定的分隔点。
-_CONCL_ANCHOR = re.compile(r"^#{1,2}\s*一[、.．]?\s*全文综合结论", re.MULTILINE)
+# 合并输出拆分锚点：模型可能使用不同标题层级、标点或直接输出“未来研究建议”。
+# 只把整行 Markdown 标题视为边界，避免正文中提到这些词时误截断。
+_CONCL_ANCHOR = re.compile(
+    r"^#{1,3}\s*(?:"
+    r"一[、.．]?\s*全文综合结论(?:与未来研究建议)?|"
+    r"二[、.．]?\s*未来(?:研究)?建议|"
+    r"三[、.．]?\s*综合结论与未来建议|"
+    r"全文综合结论(?:与未来研究建议)?|"
+    r"未来(?:研究)?建议|"
+    r"综合结论与未来建议"
+    r")\s*$",
+    re.MULTILINE,
+)
+_HORIZONTAL_RULE = re.compile(r"^\s*(?:-{3,}|\*{3,}|_{3,})\s*$")
+
+
+def _trim_section_boundary_noise(markdown: str) -> str:
+    """Remove separators accidentally left immediately around split sections."""
+    lines = (markdown or "").strip().splitlines()
+    while lines and _HORIZONTAL_RULE.match(lines[0]):
+        lines.pop(0)
+    while lines and _HORIZONTAL_RULE.match(lines[-1]):
+        lines.pop()
+    return "\n".join(lines).strip()
+
+
+def _normalize_material_output(markdown: str, *, downgrade_headings: bool = True) -> str:
+    cleaned = _trim_section_boundary_noise(markdown)
+    leak = _CONCL_ANCHOR.search(cleaned)
+    if leak:
+        cleaned = _trim_section_boundary_noise(cleaned[:leak.start()])
+    if downgrade_headings:
+        cleaned = _downgrade(cleaned)
+    return normalize_list_indentation(escape_approximate_tildes(cleaned))
+
+
+def _normalize_conclusion_output(markdown: str) -> str:
+    return escape_approximate_tildes(_trim_section_boundary_noise(_strip_fence(markdown)))
 
 
 def _split_extract_conclusion(combined_md: str) -> tuple[str, str]:
@@ -2435,8 +2964,10 @@ def _split_extract_conclusion(combined_md: str) -> tuple[str, str]:
     """
     m = _CONCL_ANCHOR.search(combined_md or "")
     if not m:
-        return (combined_md or "").strip(), ""
-    return combined_md[:m.start()].strip(), combined_md[m.start():].strip()
+        return "", ""
+    part2 = _trim_section_boundary_noise(combined_md[:m.start()])
+    part3 = _trim_section_boundary_noise(combined_md[m.start():])
+    return part2, part3
 
 
 def _run_extract_conclusion(clean, title: str, verify: bool = False, provider: str = None,
@@ -2472,21 +3003,25 @@ def _run_extract_conclusion(clean, title: str, verify: bool = False, provider: s
         )
         combined = _strip_fence(combined)
         part2, part3 = _split_extract_conclusion(combined)
-        part2 = normalize_list_indentation(escape_approximate_tildes(_downgrade(part2)))
-        part3 = _strip_fence(part3)
+        part2 = _normalize_material_output(part2)
+        part3 = _normalize_conclusion_output(part3)
         # 合并输出不完整（缺任一部分）→ 回退两次独立调用，保证两部分都产出
         if not part2.strip() or not part3.strip():
             merged = False
-            part2 = extract_from_clean_markdown(clean, title=title, verify=verify,
-                                                provider=provider, image_summary=image_summary)
-            part3 = conclude_from_clean_markdown(clean, title=title,
-                                                 provider=provider, image_summary=image_summary)
+            part2 = _normalize_material_output(extract_from_clean_markdown(
+                clean, title=title, verify=verify, provider=provider, image_summary=image_summary,
+            ))
+            part3 = _normalize_conclusion_output(conclude_from_clean_markdown(
+                clean, title=title, provider=provider, image_summary=image_summary,
+            ))
         return part2, part3, merged
     # 拆分模式：复用既有独立函数（含 verify 查漏）
-    part2 = extract_from_clean_markdown(clean, title=title, verify=verify,
-                                        provider=provider, image_summary=image_summary)
-    part3 = conclude_from_clean_markdown(clean, title=title,
-                                         provider=provider, image_summary=image_summary)
+    part2 = _normalize_material_output(extract_from_clean_markdown(
+        clean, title=title, verify=verify, provider=provider, image_summary=image_summary,
+    ))
+    part3 = _normalize_conclusion_output(conclude_from_clean_markdown(
+        clean, title=title, provider=provider, image_summary=image_summary,
+    ))
     return part2, part3, False
 
 
@@ -2512,8 +3047,8 @@ def _run_extract_conclusion_combined_only(clean, title: str, provider: str = Non
     part2, part3 = _split_extract_conclusion(combined)
     if not part2.strip() or not part3.strip():
         raise ValueError("合并输出缺少材料信息或综合结论部分")
-    part2 = normalize_list_indentation(escape_approximate_tildes(_downgrade(part2)))
-    part3 = _strip_fence(part3)
+    part2 = _normalize_material_output(part2)
+    part3 = _normalize_conclusion_output(part3)
     return part2, part3
 
 def _prune_material_tasks():
@@ -2523,6 +3058,56 @@ def _prune_material_tasks():
              if t.get("done") and now - t.get("created", now) > 3600]
     for tid in stale:
         MATERIAL_TASKS.pop(tid, None)
+    _prune_workspace_tombstones(now)
+
+
+async def _cancel_material_task(task_id: str) -> dict:
+    task = MATERIAL_TASKS.get(task_id)
+    if task is None:
+        return {
+            "ok": True, "already_removed": True,
+            "terminated_pids": [], "remaining_pids": [],
+        }
+    if task.get("done"):
+        termination = await _terminate_task_process(task)
+        if termination.get("remaining_pids") or termination.get("process_alive"):
+            return {
+                "ok": False, "cancelled": False,
+                "error": "已结束的材料任务仍有残留进程",
+                "terminated_pids": termination.get("terminated_pids", []),
+                "remaining_pids": termination.get("remaining_pids", []),
+            }
+        _close_task_queue(task)
+        await _wait_for_task_finalization(task)
+        return {
+            "ok": True, "already_done": True,
+            "cancelled": bool(task.get("cancelled")),
+            "terminated_pids": termination.get("terminated_pids", []),
+            "remaining_pids": termination.get("remaining_pids", []),
+        }
+    task["cancel"] = True
+    task["stage"] = "正在取消…"
+    termination = await _terminate_task_process(task)
+    if termination["remaining_pids"] or termination["process_alive"]:
+        task["stage"] = "进程终止失败"
+        return {
+            "ok": False, "cancelled": False,
+            "error": "材料提取进程未能完全退出",
+            "terminated_pids": termination["terminated_pids"],
+            "remaining_pids": termination["remaining_pids"],
+        }
+    _close_task_queue(task)
+    await _wait_for_task_finalization(task)
+    if not task.get("done"):
+        task.update({
+            "cancelled": True, "status": "cancelled", "stage": "已取消",
+            "done": True, "success": False,
+        })
+    return {
+        "ok": True, "stopped": True, "cancelled": True,
+        "terminated_pids": termination["terminated_pids"],
+        "remaining_pids": [],
+    }
 
 
 def _format_part1(name: str, md: str) -> str:
@@ -2762,6 +3347,7 @@ async def _material_worker_async(contents, names, document_ids, figure_indexes, 
                         clean, title=name, verify=verify, provider=provider,
                         image_summary=image_summary,
                     )
+                    part2 = _normalize_material_output(part2)
                     part2 = inject_figure_images(part2, figure_map)
                     _set_material_part(
                         paper, "part2", status="completed", content=part2,
@@ -2821,6 +3407,7 @@ async def _material_worker_async(contents, names, document_ids, figure_indexes, 
                         clean, title=name, verify=verify, provider=provider,
                         image_summary=image_summary,
                     )
+                    part2 = _normalize_material_output(part2)
                     part2 = inject_figure_images(part2, figure_map)
                     _set_material_part(
                         paper, "part2", status="completed", content=part2,
@@ -2933,6 +3520,7 @@ async def _consume_material_task(task_id: str):
     refresh_result()
     try:
         while True:
+            _snapshot_task_process_tree(task)
             try:
                 msg = await asyncio.to_thread(q.get, True, 0.5)
             except queue.Empty:
@@ -2947,6 +3535,8 @@ async def _consume_material_task(task_id: str):
                 )
                 break
             kind = msg[0]
+            if task.get("cancel"):
+                break
             if kind == "stage":
                 task["stage"] = msg[1]
             elif kind == "percent":
@@ -2986,7 +3576,7 @@ async def _consume_material_task(task_id: str):
                 await asyncio.to_thread(proc.join, 2)
             except Exception:
                 pass
-        if task.get("cancel") and not task.get("done"):
+        if task.get("cancel"):
             for paper in paper_by_index.values():
                 for part in selected_parts:
                     state = paper.get("parts", {}).get(part, {})
@@ -3017,10 +3607,7 @@ async def _consume_material_task(task_id: str):
                 proc.exitcode if proc is not None else None,
                 extra={"request_id": task.get("request_id", ""), "task_id": task_id},
             )
-        try:
-            q.close()
-        except Exception:
-            pass
+        _close_task_queue(task)
 
 
 @app.get("/api/models")
@@ -3174,6 +3761,122 @@ async def api_knowledge_asset(asset_id: str):
     )
 
 
+@app.delete("/api/material_documents/{client_document_id}")
+async def delete_material_document(client_document_id: str, request: Request):
+    """Delete one workspace document and every live task/temporary asset it owns.
+
+    Knowledge-base archives are independent database snapshots and are not
+    touched by this workspace-only operation.
+    """
+    client_document_id = str(client_document_id or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{3,160}", client_document_id):
+        return JSONResponse({"error": "非法工作区文档 ID"}, status_code=400)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    body = body if isinstance(body, dict) else {}
+    prepare_task_id = str(body.get("prepare_task_id") or "").strip()
+    server_document_id = str(body.get("server_document_id") or "").strip()
+
+    _prune_paper_prep_tasks()
+    _prune_material_tasks()
+    DELETED_WORKSPACE_DOCUMENTS[client_document_id] = time.time()
+
+    prep_task_ids = {
+        task_id for task_id, task in PAPER_PREP_TASKS.items()
+        if task.get("client_document_id") == client_document_id
+    }
+    if prepare_task_id:
+        prep_task_ids.add(prepare_task_id)
+    staged_document_ids = {server_document_id} if server_document_id else set()
+    for task_id in prep_task_ids:
+        task = PAPER_PREP_TASKS.get(task_id)
+        if task and task.get("document_id"):
+            staged_document_ids.add(str(task["document_id"]))
+
+    material_task_ids = {
+        task_id for task_id, task in MATERIAL_TASKS.items()
+        if client_document_id in (task.get("document_ids") or [])
+    }
+
+    # Stop every owned task concurrently. The tombstone above prevents a late
+    # prepare/material request from registering a new worker during this wait.
+    cancellation_jobs = [
+        (task_id, _cancel_paper_prepare_task(task_id))
+        for task_id in sorted(prep_task_ids)
+    ] + [
+        (task_id, _cancel_material_task(task_id))
+        for task_id in sorted(material_task_ids)
+    ]
+    cancellation_results = await asyncio.gather(
+        *(job for _, job in cancellation_jobs), return_exceptions=True,
+    ) if cancellation_jobs else []
+    terminated_pids: set[int] = set()
+    remaining_pids: set[int] = set()
+    termination_errors: list[str] = []
+    terminated_task_ids: list[str] = []
+    for (task_id, _), result in zip(cancellation_jobs, cancellation_results):
+        if isinstance(result, BaseException):
+            termination_errors.append(f"{task_id}: {result}")
+            continue
+        terminated_pids.update(int(pid) for pid in result.get("terminated_pids", []))
+        remaining_pids.update(int(pid) for pid in result.get("remaining_pids", []))
+        if result.get("ok") and not result.get("remaining_pids"):
+            terminated_task_ids.append(task_id)
+        else:
+            termination_errors.append(str(result.get("error") or f"{task_id} 终止失败"))
+
+    if remaining_pids or termination_errors:
+        logger.error(
+            "删除工作区文档失败：任务进程仍存活 terminated=%s remaining=%s errors=%s",
+            sorted(terminated_pids), sorted(remaining_pids), termination_errors,
+            extra={"client_document_id": client_document_id,
+                   "document_id": server_document_id},
+        )
+        return JSONResponse({
+            "ok": False,
+            "deleted": False,
+            "error": "任务进程未能完全退出，文档未删除",
+            "terminated_task_ids": sorted(terminated_task_ids),
+            "terminated_pids": sorted(terminated_pids),
+            "remaining_pids": sorted(remaining_pids),
+            "termination_errors": termination_errors,
+        }, status_code=500)
+
+    removed_directories = 0
+    try:
+        for document_id in staged_document_ids:
+            if document_id and await asyncio.to_thread(delete_document_dir, document_id):
+                removed_directories += 1
+    except (OSError, ValueError) as exc:
+        logger.exception(
+            "删除工作区文档临时资产失败",
+            extra={"document_id": server_document_id, "client_document_id": client_document_id},
+        )
+        return JSONResponse({"error": f"临时资产删除失败：{exc}"}, status_code=500)
+
+    for task_id in prep_task_ids:
+        PAPER_PREP_TASKS.pop(task_id, None)
+    for task_id in material_task_ids:
+        MATERIAL_TASKS.pop(task_id, None)
+    logger.info(
+        "工作区文档已删除 prep_tasks=%d material_tasks=%d staging=%d",
+        len(prep_task_ids), len(material_task_ids), removed_directories,
+        extra={"client_document_id": client_document_id, "document_id": server_document_id},
+    )
+    return JSONResponse({
+        "ok": True,
+        "deleted": True,
+        "prepare_tasks": len(prep_task_ids),
+        "material_tasks": len(material_task_ids),
+        "staging_directories": removed_directories,
+        "terminated_task_ids": sorted(terminated_task_ids),
+        "terminated_pids": sorted(terminated_pids),
+        "remaining_pids": [],
+    })
+
+
 @app.post("/api/material_extract")
 async def material_extract(request: Request):
     """创建材料提取运行；支持按 parts 真实执行 part1/part2/part3。"""
@@ -3182,6 +3885,7 @@ async def material_extract(request: Request):
     except Exception:
         return JSONResponse({"error": "请求体不是合法 JSON"}, status_code=400)
     body = body or {}
+    _prune_material_tasks()
     paper_rows = [paper for paper in (body.get("papers") or []) if isinstance(paper, dict)]
     if paper_rows:
         contents, names, document_ids, figure_indexes = [], [], [], []
@@ -3193,6 +3897,8 @@ async def material_extract(request: Request):
                 or ""
             )
             client_document_id = str(paper.get("id") or staged_document_id)
+            if client_document_id in DELETED_WORKSPACE_DOCUMENTS:
+                return JSONResponse({"error": "工作区文档已删除", "deleted": True}, status_code=410)
             try:
                 staged = document_dir(staged_document_id)
                 manifest = read_json(staged / "manifest.json")
@@ -3245,8 +3951,9 @@ async def material_extract(request: Request):
     document_ids = (document_ids + [""] * len(contents))[:len(contents)]
     figure_indexes = (figure_indexes + [[] for _ in contents])[:len(contents)]
     document_ids = [item or f"paper-{index + 1}" for index, item in enumerate(document_ids)]
+    if any(document_id in DELETED_WORKSPACE_DOCUMENTS for document_id in document_ids):
+        return JSONResponse({"error": "工作区文档已删除", "deleted": True}, status_code=410)
 
-    _prune_material_tasks()
     task_id = uuid.uuid4().hex
     run_id = task_id
     seed_papers = [
@@ -3265,6 +3972,7 @@ async def material_extract(request: Request):
         daemon=True,
     )
     MATERIAL_TASKS[task_id] = {
+        "task_id": task_id,
         "created": time.time(),
         "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "run_id": run_id,
@@ -3282,23 +3990,31 @@ async def material_extract(request: Request):
         "seed_papers": seed_papers,
         "proc": proc,
         "q": q,
+        "cancel": False,
+        "process_started": False,
     }
     # Windows 的 multiprocessing 启动子进程会有明显的同步开销。放到线程里启动，
     # 避免阻塞 FastAPI 事件循环，前端可以立即显示“正在启动”。
+    task = MATERIAL_TASKS[task_id]
+    starter = asyncio.create_task(asyncio.to_thread(proc.start))
+    task["start_future"] = starter
     try:
-        await asyncio.to_thread(proc.start)
+        await asyncio.shield(starter)
+        task["process_started"] = True
+        _record_task_process_identity(task)
     except Exception as exc:
         logger.exception(
             "材料提取进程启动失败",
             extra={"request_id": getattr(request.state, "request_id", ""), "task_id": task_id},
         )
         MATERIAL_TASKS.pop(task_id, None)
-        try:
-            q.close()
-        except Exception:
-            pass
+        _close_task_queue(task)
         return JSONResponse({"error": f"提取进程启动失败：{exc}"}, status_code=500)
-    asyncio.create_task(_consume_material_task(task_id))
+    if any(document_id in DELETED_WORKSPACE_DOCUMENTS for document_id in document_ids):
+        await _cancel_material_task(task_id)
+        return JSONResponse({"error": "工作区文档已删除", "deleted": True}, status_code=410)
+    consumer = asyncio.create_task(_consume_material_task(task_id))
+    task["consumer"] = consumer
     return JSONResponse({
         "task_id": task_id,
         "run_id": run_id,
@@ -3336,42 +4052,29 @@ async def stop_material(task_id: str):
     task = MATERIAL_TASKS.get(task_id)
     if task is None:
         return JSONResponse({"error": "任务不存在或已过期"}, status_code=404)
-    if task.get("done"):
-        return JSONResponse({"ok": True, "already_done": True})
-    task["cancel"] = True
-    task["stage"] = "正在取消…"
     logger.info(
         "请求取消材料提取",
         extra={"request_id": task.get("request_id", ""), "task_id": task_id},
     )
-    proc = task.get("proc")
-    if proc is not None and proc.is_alive():
-        proc.terminate()   # 立即强杀提取子进程
-        try:
-            await asyncio.to_thread(proc.join, 5)
-        except Exception:
-            pass
-        if proc.is_alive():
-            try:
-                proc.kill()
-                await asyncio.to_thread(proc.join, 2)
-            except Exception:
-                pass
-    task["cancelled"] = True
-    return JSONResponse({"ok": True, "stopped": True})
+    result = await _cancel_material_task(task_id)
+    return JSONResponse(result, status_code=200 if result.get("ok") else 500)
 
 
-# ============ 命令行入口（便于 python marker_platform.py 启动）============
-if __name__ == "__main__":
+# ============ 命令行入口（便于 python -m backend.main 启动）============
+def main():
     import click
     import uvicorn
 
     @click.command()
     @click.option("--port", type=int, default=8000, help="监听端口")
     @click.option("--host", type=str, default="127.0.0.1", help="监听地址")
-    def main(port: int, host: str):
+    def run(port: int, host: str):
         # 请求访问日志由 FastAPI middleware 统一记录，避免与 Uvicorn 默认
         # access logger 重复；应用错误仍由 uvicorn.error 进入 app.log。
         uvicorn.run(app, host=host, port=port, access_log=False, log_config=None)
 
+    run()
+
+
+if __name__ == "__main__":
     main()
