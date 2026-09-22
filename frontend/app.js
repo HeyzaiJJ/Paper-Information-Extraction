@@ -150,10 +150,58 @@ function clampMarkdownHeadingLevels(markdown) {
 }
 window.clampMarkdownHeadingLevels = clampMarkdownHeadingLevels;
 
+// Marked treats underscores inside `$...$` as emphasis before KaTeX sees the
+// text (for example `\text{Co}_{0.7}` becomes `<em>...</em>`).  Temporarily
+// replace complete TeX spans with plain alphanumeric tokens, then restore them
+// as text nodes after Markdown sanitisation and before KaTeX rendering.
+function protectMarkdownMath(markdown) {
+  const original = String(markdown || "");
+  const formulas = [];
+  let prefix = "PAPERLABLATEXPLACEHOLDER";
+  while (original.includes(prefix)) prefix += "X";
+  const pattern = /\$\$[\s\S]+?\$\$|\\\[[\s\S]+?\\\]|\\\([\s\S]+?\\\)|\$(?!\$)(?:\\.|[^\\$\r\n])+?\$/g;
+  const source = original.replace(pattern, (formula) => {
+    const token = `${prefix}${formulas.length}END`;
+    formulas.push({ token, formula });
+    return token;
+  });
+  return { source, formulas };
+}
+
+function restoreMarkdownMath(container, formulas) {
+  if (!formulas.length) return;
+  const byToken = new Map(formulas.map((item) => [item.token, item.formula]));
+  const tokenPattern = new RegExp(
+    formulas.map((item) => item.token).join("|"),
+    "g",
+  );
+  const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
+  const nodes = [];
+  while (walker.nextNode()) nodes.push(walker.currentNode);
+  nodes.forEach((node) => {
+    const value = node.nodeValue || "";
+    if (!tokenPattern.test(value)) {
+      tokenPattern.lastIndex = 0;
+      return;
+    }
+    tokenPattern.lastIndex = 0;
+    const fragment = document.createDocumentFragment();
+    let offset = 0;
+    for (const match of value.matchAll(tokenPattern)) {
+      if (match.index > offset) fragment.append(value.slice(offset, match.index));
+      fragment.append(byToken.get(match[0]) || match[0]);
+      offset = match.index + match[0].length;
+    }
+    if (offset < value.length) fragment.append(value.slice(offset));
+    node.replaceWith(fragment);
+  });
+}
+
 function renderMarkdown(container, markdown) {
-  const source = clampMarkdownHeadingLevels(escapeApproximateTildesForMarkdown(markdown));
-  if (window.marked && marked.parse) container.innerHTML = marked.parse(source);
-  else container.textContent = source;
+  const normalized = clampMarkdownHeadingLevels(escapeApproximateTildesForMarkdown(markdown));
+  const protectedMath = protectMarkdownMath(normalized);
+  if (window.marked && marked.parse) container.innerHTML = marked.parse(protectedMath.source);
+  else container.textContent = protectedMath.source;
   // 模型输出属于非可信内容：保留常用 Markdown/表格/图片，移除可执行节点与事件属性。
   container.querySelectorAll("script, iframe, object, embed, form, input, button, textarea, select").forEach((node) => node.remove());
   container.querySelectorAll("*").forEach((node) => {
@@ -165,6 +213,7 @@ function renderMarkdown(container, markdown) {
       }
     });
   });
+  restoreMarkdownMath(container, protectedMath.formulas);
   if (!window.renderMathInElement) return;
   try {
     renderMathInElement(container, {
@@ -184,33 +233,137 @@ function renderMarkdown(container, markdown) {
 
 // 仅用于报告网页预览的图号引用。图片仍由后端按 JSON FigureIndex 写入
 // 原始 Markdown，因此导出文件保持完整；网页只把已验证图号做成交互入口。
-const REPORT_FIGURE_REF_RE = /(?:Fig(?:ure)?\.?\s*|图\s*)(\d+[a-z]?(?![a-z0-9])(?:\s*(?:,|，|、|\b(?:and|to)\b|和|及|-|–|~)\s*(?:\d+[a-z]?(?![a-z0-9])|[a-z](?![a-z0-9])))*)/gi;
-const REPORT_FIGURE_TOKEN_RE = /\d+[a-z]?|[a-z](?![a-z0-9])/gi;
+const REPORT_FIGURE_REF_RE = /(?:\b(?:figs?|figures?)\.?\s*|图\s*)(\d+(?!\d)(?:[a-z]|\s*\(\s*[a-z]\s*\))?(?:\s*[-–~]\s*(?:\d+(?!\d)(?!\s*(?:[.．]\s*\d+)*\s*[.．]?\s*(?:章节|章|节))(?:[a-z]|\s*\(\s*[a-z]\s*\))?|\b[a-z]\b|\(\s*[a-z]\s*\)))?(?:\s*(?:,|，|、|\b(?:and|to)\b|和|及)\s*(?:\d+(?!\d)(?!\s*(?:[.．]\s*\d+)*\s*[.．]?\s*(?:章节|章|节))(?:[a-z]|\s*\(\s*[a-z]\s*\))?|\b[a-z]\b|\(\s*[a-z]\s*\)))*)/gi;
+const REPORT_FIGURE_TOKEN_RE = /\d+(?!\d)(?:[a-z]|\s*\(\s*[a-z]\s*\))?|\(\s*[a-z]\s*\)|\b[a-z]\b/gi;
+const REPORT_FIGURE_PREFIX_RE = /(?:\b(?:figs?|figures?)\.?\s*\d|图\s*\d)/i;
+const REPORT_SECTION_CITATION_RE = /(?:第\s*)?\d+(?:\s*[.．]\s*\d+)*\s*[.．]?\s*(?:章节|章|节)/gi;
 
 function figureKeysFromReportReference(refs, figureMap) {
   const keys = [];
+  const source = String(refs || "");
+  const tokens = Array.from(source.matchAll(REPORT_FIGURE_TOKEN_RE));
+  const requested = [];
   let currentNumber = "";
-  const tokens = String(refs || "").match(REPORT_FIGURE_TOKEN_RE) || [];
-  tokens.forEach((rawToken) => {
-    const token = rawToken.toLowerCase();
-    const numberMatch = token.match(/^(\d+)([a-z]?)$/);
-    let requested = "";
-    let parent = "";
-    if (numberMatch) {
-      currentNumber = numberMatch[1];
-      requested = "fig" + token;
-      parent = "fig" + currentNumber;
-    } else if (currentNumber) {
-      requested = "fig" + currentNumber + token;
-      parent = "fig" + currentNumber;
-    } else {
-      return;
+  let previous = null;
+
+  const addRequested = (number, letter = "") => {
+    const item = { number: String(number || ""), letter: String(letter || "") };
+    if (!item.number) return;
+    if (!requested.some((candidate) => candidate.number === item.number && candidate.letter === item.letter)) {
+      requested.push(item);
     }
-    const key = figureMap[requested] ? requested :
-      (requested !== parent && figureMap[parent] ? parent : "");
-    if (key && !keys.includes(key)) keys.push(key);
+  };
+
+  tokens.forEach((match) => {
+    const token = match[0].toLowerCase().replace(/[\s()]/g, "");
+    const numberMatch = token.match(/^(\d+)([a-z]?)$/);
+    const item = numberMatch
+      ? { number: numberMatch[1], letter: numberMatch[2] }
+      : (currentNumber ? { number: currentNumber, letter: token } : null);
+    if (!item) return;
+    currentNumber = item.number;
+    const separator = previous ? source.slice(previous.end, match.index) : "";
+    const isRange = /[-–~]|\bto\b/i.test(separator);
+    if (isRange && previous) {
+      if (!previous.letter && !item.letter) {
+        const start = Number(previous.number);
+        const end = Number(item.number);
+        if (Number.isInteger(start) && Number.isInteger(end) && Math.abs(end - start) <= 50) {
+          const step = start <= end ? 1 : -1;
+          for (let value = start; value !== end + step; value += step) addRequested(value);
+        } else {
+          addRequested(item.number, item.letter);
+        }
+      } else if (previous.number === item.number && previous.letter && item.letter) {
+        const start = previous.letter.charCodeAt(0);
+        const end = item.letter.charCodeAt(0);
+        if (Math.abs(end - start) <= 25) {
+          const step = start <= end ? 1 : -1;
+          for (let value = start; value !== end + step; value += step) {
+            addRequested(item.number, String.fromCharCode(value));
+          }
+        } else {
+          addRequested(item.number, item.letter);
+        }
+      } else {
+        addRequested(item.number, item.letter);
+      }
+    } else {
+      addRequested(item.number, item.letter);
+    }
+    previous = { ...item, end: match.index + match[0].length };
+  });
+
+  requested.forEach(({ number, letter }) => {
+    const exact = `fig${number}${letter}`;
+    const parent = `fig${number}`;
+    const resolved = figureMap[exact] ? [exact] : (letter && figureMap[parent] ? [parent] : []);
+    if (!letter && !resolved.length) {
+      Object.keys(figureMap)
+        .filter((key) => new RegExp(`^fig${number}[a-z]$`).test(key))
+        .forEach((key) => resolved.push(key));
+    }
+    resolved.forEach((key) => {
+      if (!keys.includes(key)) keys.push(key);
+    });
   });
   return keys;
+}
+
+function cleanCitationSeparators(value) {
+  REPORT_SECTION_CITATION_RE.lastIndex = 0;
+  return String(value || "")
+    .replace(REPORT_SECTION_CITATION_RE, "")
+    .replace(/^\s*[,，、;；]\s*|\s*[,，、;；]\s*$/g, "")
+    .replace(/\s*([,，、;；])\s*(?:[,，、;；]\s*)+/g, "$1 ");
+}
+
+function stripSectionCitationsNearFigures(value) {
+  let result = String(value || "");
+  const stack = [];
+  const ranges = [];
+  for (let index = 0; index < result.length; index += 1) {
+    const char = result[index];
+    if (char === "(" || char === "（") {
+      stack.push({ index, char });
+      continue;
+    }
+    if (char !== ")" && char !== "）") continue;
+    const opener = stack.pop();
+    if (!opener || (opener.char === "(" && char !== ")") || (opener.char === "（" && char !== "）")) continue;
+    const content = result.slice(opener.index + 1, index);
+    REPORT_SECTION_CITATION_RE.lastIndex = 0;
+    if (REPORT_FIGURE_PREFIX_RE.test(content) && REPORT_SECTION_CITATION_RE.test(content)) {
+      ranges.push({ start: opener.index + 1, end: index });
+    }
+  }
+  ranges.sort((left, right) => right.start - left.start).forEach(({ start, end }) => {
+    result = result.slice(0, start) + cleanCitationSeparators(result.slice(start, end)) + result.slice(end);
+  });
+  return result;
+}
+
+function cleanReportSectionCitations(container) {
+  const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      const parent = node.parentElement;
+      if (!parent || parent.closest("button, code, pre, .katex")) return NodeFilter.FILTER_REJECT;
+      REPORT_SECTION_CITATION_RE.lastIndex = 0;
+      return REPORT_SECTION_CITATION_RE.test(node.nodeValue || "")
+        ? NodeFilter.FILTER_ACCEPT
+        : NodeFilter.FILTER_REJECT;
+    },
+  });
+  const nodes = [];
+  while (walker.nextNode()) nodes.push(walker.currentNode);
+  nodes.forEach((node) => {
+    const original = node.nodeValue || "";
+    let cleaned = stripSectionCitationsNearFigures(original);
+    if (node.parentElement && node.parentElement.closest("td, th") && REPORT_FIGURE_PREFIX_RE.test(cleaned)) {
+      cleaned = cleanCitationSeparators(cleaned);
+    }
+    if (cleaned !== original) node.nodeValue = cleaned;
+  });
 }
 
 function figureMapForReport(reportId) {
@@ -681,6 +834,7 @@ function prepareReportFigureReferences(container, figureMap, showPreview, isPrev
     image.remove();
     if (parent && !parent.textContent.trim() && !parent.querySelector("img")) parent.remove();
   });
+  cleanReportSectionCitations(container);
   if (!Object.keys(figureMap).length) return;
 
   const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT, {
@@ -1671,7 +1825,7 @@ async function loadMatModels() {
     });
   } catch (e) {
     // 接口异常时兜底显示一个默认项，避免下拉框空白
-    matModelSelect.innerHTML = '<option value="mimo-v2.5-pro">mimo-v2.5-pro</option>';
+    matModelSelect.innerHTML = '<option value="mimo-v2.6-pro">mimo-v2.6-pro</option>';
   }
 }
 
@@ -2379,22 +2533,19 @@ function renderKnowledgeTree() {
     const queryMatchesReports = query ? reports.filter((report) => report.name.toLocaleLowerCase().includes(query)) : reports;
     const isExpanded = knowledgeState.expandedFolders.has(folder.id) || Boolean(query && queryMatchesReports.length);
     const row = document.createElement("div");
-    row.className = "knowledge-folder-row" + (knowledgeState.selectedFolderId === folder.id ? " is-selected" : "");
-
-    const toggle = document.createElement("button");
-    toggle.type = "button";
-    toggle.className = "knowledge-folder-toggle";
-    toggle.textContent = isExpanded ? "▾" : "▸";
-    toggle.title = isExpanded ? "收起报告" : "展开报告";
-    toggle.addEventListener("click", () => {
-      if (knowledgeState.expandedFolders.has(folder.id)) knowledgeState.expandedFolders.delete(folder.id);
-      else knowledgeState.expandedFolders.add(folder.id);
-      renderKnowledgeTree();
-    });
+    row.className = "knowledge-folder-row"
+      + (knowledgeState.selectedFolderId === folder.id ? " is-selected" : "")
+      + (isExpanded ? " is-expanded" : "");
 
     const folderButton = document.createElement("button");
     folderButton.type = "button";
     folderButton.className = "knowledge-folder-button";
+    folderButton.setAttribute("aria-expanded", String(isExpanded));
+    folderButton.setAttribute("aria-label", `${isExpanded ? "收起" : "展开并查看"}文件夹 ${folder.name}，${reportIds.length} 篇报告`);
+    const chevron = document.createElement("span");
+    chevron.className = "knowledge-folder-chevron";
+    chevron.setAttribute("aria-hidden", "true");
+    chevron.innerHTML = '<svg viewBox="0 0 20 20" focusable="false"><path d="m7.5 4.75 5.25 5.25-5.25 5.25"></path></svg>';
     const name = document.createElement("span");
     name.className = "knowledge-folder-name";
     name.textContent = folder.name;
@@ -2402,8 +2553,10 @@ function renderKnowledgeTree() {
     const count = document.createElement("span");
     count.className = "knowledge-folder-count";
     count.textContent = reportIds.length;
-    folderButton.append(name, count);
+    folderButton.append(chevron, name, count);
     folderButton.addEventListener("click", () => {
+      if (knowledgeState.expandedFolders.has(folder.id)) knowledgeState.expandedFolders.delete(folder.id);
+      else knowledgeState.expandedFolders.add(folder.id);
       knowledgeState.selectedFolderId = folder.id;
       knowledgeState.selectedReportId = "";
       exitKnowledgeManageMode(false);
@@ -2436,7 +2589,7 @@ function renderKnowledgeTree() {
     remove.addEventListener("click", () => { menu.open = false; openKnowledgeDeleteDialog(folder); });
     menuBody.append(rename, manage, remove);
     menu.append(summary, menuBody);
-    row.append(toggle, folderButton, menu);
+    row.append(folderButton, menu);
     knowledgeTreeEl.appendChild(row);
 
     if (!isExpanded) return;
@@ -2468,10 +2621,19 @@ function renderKnowledgeTree() {
   });
 }
 
-function createKnowledgeBreadcrumb(items) {
+function createKnowledgeBreadcrumb(items, onBack) {
+  const wrapper = document.createElement("div");
+  wrapper.className = "knowledge-navigation";
+  const back = document.createElement("button");
+  back.type = "button";
+  back.className = "knowledge-back-button";
+  back.title = "返回上一级";
+  back.setAttribute("aria-label", "返回上一级");
+  back.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M15 18l-6-6 6-6"></path></svg>';
+  back.addEventListener("click", onBack);
   const nav = document.createElement("nav");
   nav.className = "knowledge-breadcrumb";
-  nav.setAttribute("aria-label", "当前位置");
+  nav.setAttribute("aria-label", "上级位置");
   items.forEach((item, index) => {
     if (index) {
       const separator = document.createElement("span");
@@ -2489,7 +2651,8 @@ function createKnowledgeBreadcrumb(items) {
     part.title = item.label;
     nav.appendChild(part);
   });
-  return nav;
+  wrapper.append(back, nav);
+  return wrapper;
 }
 
 function createKnowledgeEmptyState() {
@@ -2498,7 +2661,7 @@ function createKnowledgeEmptyState() {
   const title = document.createElement("h2");
   title.textContent = "从一个归档文件夹开始";
   const copy = document.createElement("p");
-  copy.textContent = "知识库只显示你主动归档的分析报告。";
+  copy.textContent = "归档后的分析报告会显示在这里。";
   const action = document.createElement("button");
   action.type = "button";
   action.className = "knowledge-empty-action";
@@ -2559,10 +2722,7 @@ function createKnowledgeReportListItem(folder, report, managing = false) {
       }
     });
   } else {
-    const arrow = document.createElement("span");
-    arrow.className = "knowledge-report-list-arrow";
-    arrow.textContent = "›";
-    item.append(main, arrow);
+    item.append(main);
     item.addEventListener("click", () => {
       knowledgeState.selectedFolderId = folder.id;
       knowledgeState.selectedReportId = report.id;
@@ -2577,9 +2737,12 @@ function createKnowledgeFolderOverview(folder) {
   const wrapper = document.createElement("div");
   wrapper.className = "knowledge-overview";
   wrapper.appendChild(createKnowledgeBreadcrumb([
-    { label: "知识库", onClick: () => { knowledgeState.selectedFolderId = ""; exitKnowledgeManageMode(false); renderKnowledgeWorkspace(); } },
-    { label: folder.name, current: true },
-  ]));
+    { label: "知识库", current: true },
+  ], () => {
+    knowledgeState.selectedFolderId = "";
+    exitKnowledgeManageMode(false);
+    renderKnowledgeWorkspace();
+  }));
   const heading = document.createElement("div");
   heading.className = "knowledge-content-heading";
   const titleWrap = document.createElement("div");
@@ -2693,9 +2856,11 @@ function createKnowledgeReportDetail(folder, report) {
   wrapper.className = "knowledge-report-detail";
   wrapper.appendChild(createKnowledgeBreadcrumb([
     { label: "知识库", onClick: () => { knowledgeState.selectedFolderId = ""; knowledgeState.selectedReportId = ""; exitKnowledgeManageMode(false); renderKnowledgeWorkspace(); } },
-    { label: folder.name, onClick: () => { knowledgeState.selectedReportId = ""; renderKnowledgeWorkspace(); } },
-    { label: report.name, current: true },
-  ]));
+    { label: folder.name, current: true },
+  ], () => {
+    knowledgeState.selectedReportId = "";
+    renderKnowledgeWorkspace();
+  }));
   const heading = document.createElement("div");
   heading.className = "knowledge-report-heading";
   const copy = document.createElement("div");
@@ -2748,7 +2913,7 @@ function createKnowledgeReportDetail(folder, report) {
   const main = document.createElement("div");
   main.className = "knowledge-report-main";
   const figureMap = figureMapFromIndex(report.figureIndex);
-  const figurePreview = createFigurePreviewPanel(figureMap);
+  const figurePreview = createFigurePreviewPanel(figureMap, { hideWhenEmpty: true });
   const sections = [
     { content: report.part1, strip: true },
     { content: report.part2, strip: false },
@@ -2760,7 +2925,7 @@ function createKnowledgeReportDetail(folder, report) {
     const block = document.createElement("section");
     block.className = "report-sec";
     const body = document.createElement("div");
-    body.className = "report-sec-body preview-md" + (section.compact ? " report-sec-body-conclusion" : "");
+    body.className = "report-sec-body analysis-report-markdown preview-md" + (section.compact ? " report-sec-body-conclusion" : "");
     renderReportMarkdown(body, markdown, figureMap, figurePreview.show);
     block.appendChild(body);
     main.appendChild(block);
@@ -2802,30 +2967,66 @@ function renderKnowledgeWorkspace() {
 }
 
 function enableKnowledgeSplitter() {
+  const minWidth = 240;
+  const maxWidth = 520;
+  const keyboardStep = 16;
+  const treePanel = knowledgeLayoutEl.querySelector(".knowledge-tree-panel");
+  const clampWidth = (width) => Math.max(minWidth, Math.min(maxWidth, width));
+  const updateValue = (width) => {
+    const rounded = Math.round(width);
+    knowledgeSplitterEl.setAttribute("aria-valuenow", String(rounded));
+    knowledgeSplitterEl.setAttribute("aria-valuetext", `${rounded} 像素`);
+    return rounded;
+  };
+  const setWidth = (width, persist = false) => {
+    const nextWidth = updateValue(clampWidth(width));
+    knowledgeLayoutEl.style.setProperty("--knowledge-tree-width", `${nextWidth}px`);
+    if (persist) sessionStorage.setItem("knowledge-tree-width", String(nextWidth));
+    return nextWidth;
+  };
   const savedWidth = Number(sessionStorage.getItem("knowledge-tree-width"));
-  if (savedWidth >= 220 && savedWidth <= 480) {
-    knowledgeLayoutEl.style.setProperty("--knowledge-tree-width", `${savedWidth}px`);
-  }
-  knowledgeSplitterEl.addEventListener("mousedown", (event) => {
+  const initialWidth = savedWidth >= minWidth && savedWidth <= maxWidth ? savedWidth : 300;
+  setWidth(initialWidth);
+
+  let activePointerId = null;
+  let startX = 0;
+  let startWidth = 0;
+  const finishDrag = (event) => {
+    if (activePointerId === null || event.pointerId !== activePointerId) return;
+    setWidth(treePanel.getBoundingClientRect().width, true);
+    if (knowledgeSplitterEl.hasPointerCapture?.(activePointerId)) {
+      knowledgeSplitterEl.releasePointerCapture(activePointerId);
+    }
+    activePointerId = null;
+    knowledgeSplitterEl.classList.remove("dragging");
+    document.body.style.userSelect = "";
+  };
+  knowledgeSplitterEl.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0) return;
     event.preventDefault();
+    activePointerId = event.pointerId;
+    startX = event.clientX;
+    startWidth = treePanel.getBoundingClientRect().width;
+    knowledgeSplitterEl.setPointerCapture?.(event.pointerId);
     knowledgeSplitterEl.classList.add("dragging");
-    const startX = event.clientX;
-    const startWidth = document.querySelector(".knowledge-tree-panel").getBoundingClientRect().width;
-    const onMove = (moveEvent) => {
-      const width = Math.max(220, Math.min(480, startWidth + moveEvent.clientX - startX));
-      knowledgeLayoutEl.style.setProperty("--knowledge-tree-width", `${Math.round(width)}px`);
-    };
-    const onUp = () => {
-      const width = Math.round(document.querySelector(".knowledge-tree-panel").getBoundingClientRect().width);
-      sessionStorage.setItem("knowledge-tree-width", String(width));
-      knowledgeSplitterEl.classList.remove("dragging");
-      document.removeEventListener("mousemove", onMove);
-      document.removeEventListener("mouseup", onUp);
-      document.body.style.userSelect = "";
-    };
-    document.addEventListener("mousemove", onMove);
-    document.addEventListener("mouseup", onUp);
     document.body.style.userSelect = "none";
+  });
+  knowledgeSplitterEl.addEventListener("pointermove", (event) => {
+    if (event.pointerId !== activePointerId) return;
+    setWidth(startWidth + event.clientX - startX);
+  });
+  knowledgeSplitterEl.addEventListener("pointerup", finishDrag);
+  knowledgeSplitterEl.addEventListener("pointercancel", finishDrag);
+  knowledgeSplitterEl.addEventListener("keydown", (event) => {
+    const currentWidth = treePanel.getBoundingClientRect().width;
+    let nextWidth = currentWidth;
+    if (event.key === "ArrowLeft") nextWidth -= keyboardStep;
+    else if (event.key === "ArrowRight") nextWidth += keyboardStep;
+    else if (event.key === "Home") nextWidth = minWidth;
+    else if (event.key === "End") nextWidth = maxWidth;
+    else return;
+    event.preventDefault();
+    setWidth(nextWidth, true);
   });
 }
 

@@ -16,6 +16,8 @@ import shutil
 import subprocess
 import tempfile
 from collections import defaultdict
+from html import unescape as html_unescape
+from html.parser import HTMLParser
 from pathlib import Path
 
 
@@ -27,6 +29,73 @@ _CONTENT_REF_RE = re.compile(r"<content-ref\b[^>]*\bsrc=[\"']([^\"']+)", re.IGNO
 _VISUAL_TYPES = {"figure", "picture", "chart", "image", "11", "20"}
 _CAPTION_TYPES = {"caption", "9"}
 _FIGURE_GROUP_TYPES = {"figuregroup", "figure_group", "4"}
+
+
+class _FigureAnchorParser(HTMLParser):
+    """Read Marker figure backlinks and their exact in-document targets."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.anchor_ids: set[str] = set()
+        self.links: list[tuple[str, str]] = []
+        self._active_target = ""
+        self._active_text: list[str] = []
+
+    def handle_starttag(self, tag, attrs):
+        attributes = {str(name).casefold(): value for name, value in attrs}
+        anchor_id = attributes.get("id")
+        if isinstance(anchor_id, str) and anchor_id.strip():
+            self.anchor_ids.add(anchor_id.strip().casefold())
+        if str(tag).casefold() != "a":
+            return
+        href = attributes.get("href")
+        if isinstance(href, str) and href.strip().startswith("#"):
+            self._active_target = href.strip()[1:].casefold()
+            self._active_text = []
+
+    def handle_data(self, data):
+        if self._active_target:
+            self._active_text.append(str(data or ""))
+
+    def handle_endtag(self, tag):
+        if str(tag).casefold() != "a" or not self._active_target:
+            return
+        self.links.append((self._active_target, "".join(self._active_text).strip()))
+        self._active_target = ""
+        self._active_text = []
+
+
+def marker_figure_anchor_links(value: str) -> tuple[set[str], list[tuple[str, list[str]]]]:
+    """Return HTML anchor IDs and explicit ``Fig. N`` links from one Marker node.
+
+    The PDF's own link target is stronger evidence than document order or a
+    nearest-neighbour guess, and may intentionally point several figure numbers
+    at one composite image.
+    """
+    parser = _FigureAnchorParser()
+    try:
+        parser.feed(str(value or ""))
+        parser.close()
+    except Exception:
+        return set(), []
+    links = []
+    for target, label in parser.links:
+        match = re.search(r"\bfig(?:ure)?s?\.?\s*(.+)", html_unescape(label), re.IGNORECASE)
+        if not match:
+            continue
+        figure_ids = []
+        for number, bare_letter, parenthesized_letter in re.findall(
+            r"(\d+)(?:([a-z])|\s*\(\s*([a-z])\s*\))?",
+            match.group(1),
+            re.IGNORECASE,
+        ):
+            letter = bare_letter or parenthesized_letter
+            figure_id = f"fig{number}{letter.lower()}"
+            if figure_id not in figure_ids:
+                figure_ids.append(figure_id)
+        if figure_ids:
+            links.append((target, figure_ids))
+    return parser.anchor_ids, links
 
 
 def _normalized_ref(value) -> str:
@@ -338,7 +407,7 @@ def _figure_regions(internal_json: str) -> list[dict]:
     # Match all remaining captions in one pass. Mutual unique-nearest
     # matching prevents two captions from reusing one visual and refuses ties
     # instead of silently choosing by traversal order.
-    candidates: list[tuple[float, int, int]] = []
+    candidates: list[tuple[float, float, int, int]] = []
     for caption_index, entry in enumerate(caption_entries):
         if entry["id"] in claimed_caption_ids:
             continue
@@ -357,29 +426,38 @@ def _figure_regions(internal_json: str) -> list[dict]:
                 (visual_box[0] + visual_box[2]) / 2,
                 (visual_box[1] + visual_box[3]) / 2,
             )
-            distance = (
+            # Captions normally sit immediately below their visual.  A plain
+            # centre-distance match can let the following figure steal the
+            # previous caption (Fig. 2 / Fig. 3 is a common two-column case).
+            # Keep below-caption visuals as a fallback, but rank every visual
+            # that ends before the caption ahead of them.
+            follows_visual = visual_box[3] <= caption_box[1] + 6
+            direction_penalty = 0 if follows_visual else 1_000_000_000
+            raw_distance = (
                 (caption_center[0] - visual_center[0]) ** 2
                 + (caption_center[1] - visual_center[1]) ** 2
             )
-            candidates.append((distance, caption_index, visual_index))
+            candidates.append((direction_penalty + raw_distance, raw_distance, caption_index, visual_index))
 
-    by_caption: dict[int, list[tuple[float, int]]] = {}
-    by_visual: dict[int, list[tuple[float, int]]] = {}
-    for distance, caption_index, visual_index in candidates:
-        by_caption.setdefault(caption_index, []).append((distance, visual_index))
-        by_visual.setdefault(visual_index, []).append((distance, caption_index))
+    by_caption: dict[int, list[tuple[float, float, int]]] = {}
+    by_visual: dict[int, list[tuple[float, float, int]]] = {}
+    for distance, raw_distance, caption_index, visual_index in candidates:
+        by_caption.setdefault(caption_index, []).append((distance, raw_distance, visual_index))
+        by_visual.setdefault(visual_index, []).append((distance, raw_distance, caption_index))
 
     nearest_caption: dict[int, int] = {}
     for caption_index, matches in by_caption.items():
-        matches.sort()
-        if len(matches) == 1 or matches[0][0] < matches[1][0]:
-            nearest_caption[caption_index] = matches[0][1]
+        matches.sort(key=lambda item: (item[0], item[1], item[2]))
+        # Preserve the ambiguity guard from the original matcher: directional
+        # preference may break a near-by/next-figure tie, never an exact one.
+        if len(matches) == 1 or abs(matches[0][1] - matches[1][1]) > 1e-9:
+            nearest_caption[caption_index] = matches[0][2]
 
     nearest_visual: dict[int, int] = {}
     for visual_index, matches in by_visual.items():
-        matches.sort()
-        if len(matches) == 1 or matches[0][0] < matches[1][0]:
-            nearest_visual[visual_index] = matches[0][1]
+        matches.sort(key=lambda item: (item[0], item[1], item[2]))
+        if len(matches) == 1 or abs(matches[0][1] - matches[1][1]) > 1e-9:
+            nearest_visual[visual_index] = matches[0][2]
 
     for caption_index, visual_index in nearest_caption.items():
         if nearest_visual.get(visual_index) != caption_index:

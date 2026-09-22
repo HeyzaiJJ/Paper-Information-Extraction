@@ -65,7 +65,7 @@ def get_model_config(provider: str = None) -> dict:
     dotenv = _load_dotenv()
     yaml_cfg = _load_model_config()
 
-    provider = provider or yaml_cfg.get("default_provider", "mimo-v2.5-pro")
+    provider = provider or yaml_cfg.get("default_provider", "mimo-v2.6-pro")
     prov = yaml_cfg.get("providers", {}).get(provider, {})
 
     api_key_env = prov.get("api_key_env", "")
@@ -121,13 +121,13 @@ def list_providers() -> list:
 def get_vision_config() -> dict:
     """读取 models.yaml 的 vision: 段，带默认值。
 
-    视觉专家固定由该段指定的 provider（默认 qwen3.6-flash）承担图片分析，
+    视觉专家固定由该段指定的 provider（默认 mimo-v2.6-flash）承担图片分析，
     与文本分析所选模型解耦。
     """
     yaml_cfg = _load_model_config()
     v = yaml_cfg.get("vision", {})
     return {
-        "provider": v.get("provider", "qwen3.6-flash"),
+        "provider": v.get("provider", "mimo-v2.6-flash"),
         "concurrency": int(v.get("concurrency", 10)),
         "batch_per_call": int(v.get("batch_per_call", 3)),
         "max_images_per_paper": int(v.get("max_images_per_paper", 60)),

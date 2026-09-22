@@ -20,6 +20,8 @@
       filesEmpty: root.querySelector("#mw-files-empty"), addFile: root.querySelector("#mw-add-file"),
       addFileInput: root.querySelector("#mw-add-file-input"),
       start: root.querySelector("#mw-start"), model: root.querySelector("#mw-model"),
+      modelPicker: root.querySelector("#mw-model-picker"), modelTrigger: root.querySelector("#mw-model-trigger"),
+      modelValue: root.querySelector("#mw-model-value"), modelMenu: root.querySelector("#mw-model-menu"),
       headerStatus: root.querySelector("#mw-header-status-text"), resultsCount: root.querySelector("#mw-results-count"),
       resultList: root.querySelector("#mw-result-list"), detailEmpty: root.querySelector("#mw-detail-empty"),
       detailContent: root.querySelector("#mw-detail-content"), detailName: root.querySelector("#mw-detail-name"),
@@ -51,6 +53,8 @@
     let lastTaskMessage = "暂无提取任务";
     let lastFileSignature = "";
     let renderScheduled = false;
+    let modelPickerOpen = false;
+    let highlightedModelValue = "";
 
     const files = () => bridge.getFiles() || [];
     const fileById = (id) => files().find((item) => item.id === id) || null;
@@ -83,6 +87,94 @@
     function modelLabel(state) {
       if (!state) return "";
       return state.model_label || modelLabels[state.model] || state.model || "";
+    }
+
+    function modelOptions() {
+      return [...(el.model?.options || [])];
+    }
+
+    function enabledModelOptions() {
+      return modelOptions().filter((option) => !option.disabled && option.value);
+    }
+
+    function setHighlightedModel(value) {
+      highlightedModelValue = value || "";
+      const options = modelOptions();
+      options.forEach((option, index) => {
+        const item = el.modelMenu?.querySelector(`[data-model-index="${index}"]`);
+        if (!item) return;
+        const active = option.value === highlightedModelValue;
+        item.classList.toggle("is-highlighted", active);
+        item.setAttribute("aria-selected", String(option.value === el.model.value));
+        if (active) {
+          el.modelTrigger?.setAttribute("aria-activedescendant", item.id);
+          if (modelPickerOpen) item.scrollIntoView({ block: "nearest" });
+        }
+      });
+    }
+
+    function syncModelPicker() {
+      if (!el.modelPicker || !el.modelTrigger || !el.modelMenu || !el.modelValue) return;
+      const options = modelOptions();
+      const selected = el.model.selectedOptions?.[0] || options.find((option) => option.value === el.model.value);
+      el.modelValue.textContent = selected?.textContent || "选择模型";
+      el.modelMenu.innerHTML = "";
+      options.forEach((option, index) => {
+        const item = document.createElement("li");
+        item.id = `mw-model-option-${index}`;
+        item.className = "mw-model-option";
+        item.dataset.modelIndex = String(index);
+        item.setAttribute("role", "option");
+        item.setAttribute("aria-selected", String(option.value === el.model.value));
+        item.setAttribute("aria-disabled", String(Boolean(option.disabled)));
+        item.textContent = option.textContent || option.value || "未命名模型";
+        if (option.disabled) item.classList.add("is-disabled");
+        else item.addEventListener("click", () => selectModel(option.value));
+        el.modelMenu.appendChild(item);
+      });
+      highlightedModelValue = selected?.value || enabledModelOptions()[0]?.value || "";
+      el.modelTrigger.disabled = !enabledModelOptions().length;
+      setHighlightedModel(highlightedModelValue);
+      el.modelMenu.setAttribute("aria-hidden", String(!modelPickerOpen));
+      refreshIcons();
+    }
+
+    function setModelPickerOpen(open, { focusTrigger = false } = {}) {
+      if (!el.modelPicker || !el.modelTrigger || !el.modelMenu) return;
+      modelPickerOpen = Boolean(open) && !el.modelTrigger.disabled;
+      el.modelPicker.classList.toggle("is-open", modelPickerOpen);
+      el.modelTrigger.setAttribute("aria-expanded", String(modelPickerOpen));
+      el.modelMenu.setAttribute("aria-hidden", String(!modelPickerOpen));
+      if (modelPickerOpen) {
+        setHighlightedModel(el.model.value || enabledModelOptions()[0]?.value || "");
+      } else {
+        el.modelTrigger.removeAttribute("aria-activedescendant");
+        if (focusTrigger) el.modelTrigger.focus();
+      }
+    }
+
+    function selectModel(value) {
+      const option = modelOptions().find((item) => item.value === value && !item.disabled);
+      if (!option) return;
+      el.model.value = option.value;
+      el.model.dispatchEvent(new Event("change", { bubbles: true }));
+      setModelPickerOpen(false);
+    }
+
+    function moveModelHighlight(step) {
+      const options = enabledModelOptions();
+      if (!options.length) return;
+      let index = options.findIndex((option) => option.value === highlightedModelValue);
+      if (index < 0) index = options.findIndex((option) => option.value === el.model.value);
+      if (index < 0) index = 0;
+      const next = (index + step + options.length) % options.length;
+      setHighlightedModel(options[next].value);
+    }
+
+    function jumpModelHighlight(edge) {
+      const options = enabledModelOptions();
+      if (!options.length) return;
+      setHighlightedModel(options[edge === "end" ? options.length - 1 : 0].value);
     }
 
     function targetKey(documentId, part) {
@@ -498,7 +590,7 @@
       const content = document.createElement("div");
       content.className = "mw-report-content";
       const body = document.createElement("div");
-      body.className = "mw-report-markdown preview-md";
+      body.className = "mw-report-markdown analysis-report-markdown preview-md";
       const markdown = part === "part2"
         ? effective.content
         : stripLeadingName(effective.content, result.name);
@@ -562,6 +654,7 @@
         );
       } else if (attempt && ["queued", "running"].includes(attempt.status)) {
         const state = document.createElement("div"); state.className = "mw-report-state";
+        state.style.setProperty("--mw-spin-phase", `-${Date.now() % 900}ms`);
         state.innerHTML = `<i data-lucide="loader-circle" class="mw-spin" aria-hidden="true"></i><strong>正在提取</strong><span>${escapeHtml(modelLabel(attempt) || "模型处理中")}</span>`;
         const action = partIsRunning ? cancelTaskButton(runningTask) : null;
         if (action) state.appendChild(action);
@@ -646,7 +739,8 @@
           option.disabled = !model.configured; option.selected = Boolean(model.default); el.model.appendChild(option);
         });
         if (!el.model.value) { const first = [...el.model.options].find((option) => !option.disabled); if (first) first.selected = true; }
-      } catch (error) { el.model.innerHTML = '<option value="">模型列表加载失败</option>'; }
+      } catch (error) { el.model.innerHTML = '<option value="" disabled selected>模型列表加载失败</option>'; }
+      syncModelPicker();
       refreshStartButton();
     }
 
@@ -822,10 +916,30 @@
       });
       el.addFileInput.value = ""; renderAll();
     });
-    el.start.addEventListener("click", startExtraction); el.model.addEventListener("change", refreshStartButton);
+    el.start.addEventListener("click", startExtraction);
+    el.model.addEventListener("change", () => { syncModelPicker(); refreshStartButton(); });
+    el.modelTrigger?.addEventListener("click", () => setModelPickerOpen(!modelPickerOpen));
+    el.modelTrigger?.addEventListener("keydown", (event) => {
+      if (["ArrowDown", "ArrowUp", "Enter", " "].includes(event.key)) {
+        event.preventDefault();
+        if (!modelPickerOpen) { setModelPickerOpen(true); return; }
+        if (event.key === "ArrowDown") moveModelHighlight(1);
+        else if (event.key === "ArrowUp") moveModelHighlight(-1);
+        else if (event.key === "Enter" || event.key === " ") selectModel(highlightedModelValue);
+      } else if (event.key === "Home" && modelPickerOpen) {
+        event.preventDefault(); jumpModelHighlight("start");
+      } else if (event.key === "End" && modelPickerOpen) {
+        event.preventDefault(); jumpModelHighlight("end");
+      } else if (event.key === "Escape" && modelPickerOpen) {
+        event.preventDefault(); setModelPickerOpen(false, { focusTrigger: true });
+      }
+    });
+    document.addEventListener("click", (event) => {
+      if (modelPickerOpen && el.modelPicker && !el.modelPicker.contains(event.target)) setModelPickerOpen(false);
+    });
     el.exportBtn.addEventListener("click", exportCurrent); el.archiveBtn.addEventListener("click", archiveCurrent);
 
-    loadModels(); renderAll();
+    loadModels(); renderAll(); syncModelPicker();
     setInterval(() => {
       if (fileSignature() !== lastFileSignature) renderAll();
       else refreshStartButton();

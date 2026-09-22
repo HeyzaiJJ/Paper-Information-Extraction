@@ -12,17 +12,17 @@ BACKEND_ROOT = ROOT / "backend"
 sys.path.insert(0, str(ROOT))
 
 from backend.knowledge_db import Base  # noqa: E402
-from backend.runtime_config import RUNTIME_CONFIG  # noqa: E402
+from backend.runtime_config import RUNTIME_CONFIG, database_url as resolve_database_url  # noqa: E402
 
 
 config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-database_url = str(RUNTIME_CONFIG.storage.get("database_url") or "sqlite:///data/marker_web.sqlite3")
-if database_url.startswith("sqlite:///") and not database_url.startswith("sqlite:////"):
-    database_url = "sqlite:///" + str((BACKEND_ROOT / database_url[len("sqlite:///"):]).resolve()).replace("\\", "/")
-config.set_main_option("sqlalchemy.url", database_url)
+database_url = resolve_database_url(RUNTIME_CONFIG)
+# ConfigParser treats '%' as interpolation syntax. SQLAlchemy's URL renderer
+# may legitimately emit percent escapes for special characters in passwords.
+config.set_main_option("sqlalchemy.url", database_url.replace("%", "%%"))
 target_metadata = Base.metadata
 
 

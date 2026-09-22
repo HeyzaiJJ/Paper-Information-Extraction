@@ -1,7 +1,7 @@
-"""vision.py —— 视觉专家：并发调用 qwen3.6-flash 分析论文图片，产出 image_summary。
+"""vision.py —— 视觉专家：并发调用 mimo-v2.6-flash 分析论文图片，产出 image_summary。
 
 设计要点：
-  - 视觉专家固定由 config/models.yaml 的 vision: 段指定（默认 qwen3.6-flash），
+  - 视觉专家固定由 config/models.yaml 的 vision: 段指定（默认 mimo-v2.6-flash），
     与文本分析所选模型解耦（文本按前端下拉选中的 provider）。
   - 信号量限并发（concurrency），每调用带 batch_per_call 张图，429/超时指数退避重试。
   - 全失败返回 ''，由调用方纯文本兜底，不中断整篇。

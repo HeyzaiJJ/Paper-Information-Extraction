@@ -1,19 +1,3 @@
-"""
-基于 marker_demo.py 的 FastAPI 平台版。
-
-与 marker_demo.py 的区别：
-  - 模型在启动时只加载一次（lifespan），常驻显存，所有请求复用。
-  - 提供网页上传界面（GET /）和上传转换接口（POST /convert）。
-  - 网页端：上传后可逐个删除文件、多选输出格式，转换后在页面内预览、逐卡片右上角下载。
-  - 接口端（不带 return_json）：单文件直接下载，多文件打包 zip（兼容 curl / 直接调用）。
-
-运行（PowerShell，项目根目录）：
-    $env:HF_ENDPOINT = "https://hf-mirror.com"
-    $env:TORCH_DEVICE = "cuda"
-    .\\.venv\\Scripts\\python.exe -m backend.main --port 8000
-然后浏览器打开 http://127.0.0.1:8000  （接口文档在 /docs）
-"""
-
 import asyncio
 import base64
 import copy
@@ -77,7 +61,7 @@ from marker.config.parser import ConfigParser
 from marker.output import text_from_rendered
 from marker.renderers.json import JSONRenderer
 from marker.renderers.markdown import MarkdownRenderer
-from backend.preprocess.pdf_figures import render_complete_figure_images
+from backend.preprocess.pdf_figures import marker_figure_anchor_links, render_complete_figure_images
 from backend.marker_engine import MarkerEngine, convert_pdf_to_staging
 from backend.temp_assets import (
     EXPORT_DIR,
@@ -1693,10 +1677,10 @@ def _ref_block_type(ref: str) -> str:
 def _build_figure_index(internal_json: str) -> list[dict]:
     """从 Marker JSON 的 Figure/Caption 节点建立图号白名单。
 
-    Marker 不同版本的 JSON 字段名略有差异，因此这里按节点类型和 caption 文本双重
-    识别真实 Fig. N，并保留 JSON 中可用的 page_id / polygon / bbox。Caption 与
-    Figure/Picture 仅在同页按坐标一对一配对；图片只读取 JSON Figure 节点引用的
-    Marker 图片资源。完全不使用 Markdown 图注、文档顺序或距离推断。
+    Marker 不同版本的 JSON 字段名略有差异，因此这里按节点类型、caption 文本和
+    PDF 内部锚点识别真实 Fig. N，并保留 JSON 中可用的 page_id / polygon / bbox。
+    Caption 与 Figure/Picture 仅在同页按坐标一对一配对；图片只读取 JSON Figure
+    节点引用的 Marker 图片资源，不使用 Markdown 图注或正文顺序猜测图号。
     """
     try:
         payload = json.loads(internal_json or "{}")
@@ -1707,6 +1691,8 @@ def _build_figure_index(internal_json: str) -> list[dict]:
 
     figure_nodes: list[dict] = []
     figure_nodes_by_ref: dict[str, set[int]] = {}
+    figure_nodes_by_anchor: dict[str, set[int]] = {}
+    figure_link_refs: list[tuple[str, str]] = []
     caption_figures_by_ref: dict[str, set[str]] = {}
     figure_group_refs: list[dict] = []
     labelled_figure_nodes: set[int] = set()
@@ -1734,9 +1720,7 @@ def _build_figure_index(internal_json: str) -> list[dict]:
             or node.get("name")
             or ""
         ).strip().lower()
-        current_page = page
-        if block_type == "page":
-            current_page = page_number_from_node(node, page)
+        current_page = page_number_from_node(node, page)
         text = _json_text(node)
         fig_id, label = _first_figure_label(text)
         is_visual_node = block_type in {"figure", "picture", "chart", "image", "11", "20"}
@@ -1765,6 +1749,12 @@ def _build_figure_index(internal_json: str) -> list[dict]:
                 current_page,
                 node_index,
             )
+        anchor_ids, anchor_links = marker_figure_anchor_links(text)
+        if node_index is not None:
+            for anchor_id in anchor_ids:
+                figure_nodes_by_anchor.setdefault(anchor_id, set()).add(node_index)
+        for anchor_id, linked_figure_ids in anchor_links:
+            figure_link_refs.extend((figure_id, anchor_id) for figure_id in linked_figure_ids)
         if is_figure_group:
             refs = _figure_group_content_refs(text)
             for member in node.get("structure") or []:
@@ -1828,6 +1818,39 @@ def _build_figure_index(internal_json: str) -> list[dict]:
 
     visit(payload)
 
+    # Marker preserves PDF hyperlinks such as ``<a href="#page-5-1">Fig. 7</a>``
+    # and places the matching id on the visual node. These exact backlinks
+    # recover figures whose extracted image has no caption node. A composite
+    # visual may intentionally be the target of more than one figure number.
+    explicit_nodes_by_figure: dict[str, set[int]] = {}
+    for fig_id, anchor_id in figure_link_refs:
+        node_indexes = figure_nodes_by_anchor.get(anchor_id) or set()
+        if len(node_indexes) == 1:
+            explicit_nodes_by_figure.setdefault(fig_id, set()).update(node_indexes)
+    explicit_figures: set[str] = set()
+    explicit_nodes: set[int] = set()
+    for fig_id, node_indexes in explicit_nodes_by_figure.items():
+        if len(node_indexes) != 1:
+            continue
+        node_index = next(iter(node_indexes))
+        node = figure_nodes[node_index]
+        entry = figures.setdefault(fig_id, {
+            "id": fig_id,
+            "label": f"Fig. {fig_id[3:]}",
+            "caption": f"Fig. {fig_id[3:]}",
+            "page": node.get("page"),
+            "bbox": node.get("bbox"),
+            "position": node.get("order", 0),
+            "image": "",
+        })
+        entry["page"] = node.get("page")
+        entry["bbox"] = node.get("bbox")
+        entry["position"] = node.get("order", entry.get("position", 0))
+        entry["images"] = node.get("images") or []
+        entry["binding"] = "pdf-anchor"
+        explicit_figures.add(fig_id)
+        explicit_nodes.add(node_index)
+
     # A FigureGroup records Marker JSON's explicit Figure/Caption membership. Use
     # only unambiguous one-to-one groups before considering geometric fallback.
     direct_pairs: set[tuple[str, int]] = set()
@@ -1854,11 +1877,15 @@ def _build_figure_index(internal_json: str) -> list[dict]:
     claimed_figures = {
         fig_id for fig_id, entry in figures.items() if entry.get("images")
     }
-    claimed_nodes = set(labelled_figure_nodes)
+    claimed_nodes = set(labelled_figure_nodes) | explicit_nodes
     for fig_id, node_indexes in direct_by_figure.items():
+        if fig_id in explicit_figures:
+            continue
         if len(node_indexes) != 1:
             continue
         node_index = next(iter(node_indexes))
+        if node_index in explicit_nodes:
+            continue
         if len(direct_by_node.get(node_index, set())) != 1 or fig_id not in figures:
             continue
         node = figure_nodes[node_index]
@@ -1935,6 +1962,97 @@ def _build_figure_index(internal_json: str) -> list[dict]:
     return sorted(figures.values(), key=sort_key)
 
 
+def _repair_staged_figure_index(
+    staged: Path,
+    manifest: dict,
+    figure_index: list[dict],
+    document_id: str,
+) -> list[dict]:
+    """One-time compatibility repair for indexes created before anchor binding."""
+    if int(manifest.get("figure_index_anchor_version") or 0) >= 2:
+        return figure_index
+    structure_path = staged / "structure.json"
+    if not structure_path.exists():
+        return figure_index
+    rebuilt = _build_figure_index(structure_path.read_text(encoding="utf-8"))
+    by_id = {
+        str(item.get("id") or "").lower(): dict(item)
+        for item in figure_index or []
+        if str(item.get("id") or "")
+    }
+    changed = False
+    for candidate in rebuilt:
+        figure_id = str(candidate.get("id") or "").lower()
+        if not figure_id:
+            continue
+        current = by_id.get(figure_id)
+        is_explicit = candidate.get("binding") == "pdf-anchor"
+        has_current_image = bool(current and (current.get("temp_asset_id") or current.get("image_url")))
+        if current is None:
+            by_id[figure_id] = dict(candidate)
+            changed = True
+        elif is_explicit or (not has_current_image and candidate.get("image")):
+            merged = {**current, **candidate}
+            if is_explicit:
+                merged.pop("temp_asset_id", None)
+                merged.pop("image_url", None)
+            by_id[figure_id] = merged
+            changed = True
+    repaired = list(by_id.values())
+    assets = list(manifest.get("assets") or [])
+    if changed:
+        repaired, assets = persist_figure_index_images(
+            staged, repaired, assets,
+        )
+        for figure in repaired:
+            if figure.get("image_url"):
+                figure["image_url"] = figure["image_url"].replace(
+                    "{document_id}", document_id,
+                )
+
+    # Older indexes can contain the right figure/page but no image relation.
+    # Bind by order only when that page has exactly the same number of numbered
+    # figures and Marker visual assets; otherwise leave it unresolved.
+    marker_asset_re = re.compile(
+        r"^_page_(\d+)_(?:figure|picture|chart|diagram)_(\d+)",
+        re.IGNORECASE,
+    )
+    figures_by_page: dict[int, list[dict]] = {}
+    assets_by_page: dict[int, list[tuple[int, dict]]] = {}
+    for figure in repaired:
+        if isinstance(figure.get("page"), (int, float)):
+            figures_by_page.setdefault(int(figure["page"]), []).append(figure)
+    for asset in assets:
+        match = marker_asset_re.match(str(asset.get("marker_name") or ""))
+        if match and asset.get("asset_id"):
+            assets_by_page.setdefault(int(match.group(1)), []).append((int(match.group(2)), asset))
+
+    def figure_order(item: dict) -> tuple[int, str]:
+        suffix = str(item.get("id") or "")[3:].lower()
+        match = re.match(r"(\d+)([a-z]?)", suffix)
+        return (int(match.group(1)), match.group(2)) if match else (10**9, suffix)
+
+    for page, figures_on_page in figures_by_page.items():
+        candidates = assets_by_page.get(page) or []
+        if len(figures_on_page) != len(candidates):
+            continue
+        figures_on_page.sort(key=figure_order)
+        candidates.sort(key=lambda item: item[0])
+        for figure, (_, asset) in zip(figures_on_page, candidates):
+            if figure.get("temp_asset_id") or figure.get("image_url"):
+                continue
+            figure["temp_asset_id"] = asset["asset_id"]
+            figure["image_url"] = f"/api/temp-assets/{document_id}/{asset['asset_id']}"
+            changed = True
+
+    if changed:
+        manifest["assets"] = assets
+        write_json(staged / "figure_index.json", repaired)
+    manifest["figure_index_anchor_version"] = 2
+    write_json(staged / "manifest.json", manifest)
+    return repaired
+
+
 def _paper_prepare_worker(
     pdf_path,
     source_name,
@@ -1976,7 +2094,7 @@ def _paper_prepare_worker(
             )
             for figure in figure_index:
                 image = repaired.get(str(figure.get("id") or "").lower())
-                if image:
+                if image and figure.get("binding") != "pdf-anchor":
                     figure["image"] = image
             figure_index, assets = persist_figure_index_images(
                 doc_dir_path, figure_index, assets,
@@ -3905,6 +4023,13 @@ async def material_extract(request: Request):
                 markdown = (staged / "document.md").read_text(encoding="utf-8")
                 figure_index_path = staged / "figure_index.json"
                 figure_index = read_json(figure_index_path) if figure_index_path.exists() else []
+                figure_index = await asyncio.to_thread(
+                    _repair_staged_figure_index,
+                    staged,
+                    manifest,
+                    figure_index,
+                    staged_document_id,
+                )
                 figure_index = [
                     {**item, "document_id": staged_document_id}
                     for item in figure_index

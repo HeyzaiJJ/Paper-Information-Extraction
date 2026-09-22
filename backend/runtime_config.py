@@ -19,6 +19,7 @@ from urllib.parse import urlparse
 import httpx
 import yaml
 from dotenv import load_dotenv
+from sqlalchemy.engine import URL
 
 from backend.paths import BACKEND_ROOT, REPO_ROOT, CONFIG_DIR
 
@@ -63,6 +64,53 @@ class RuntimeConfig:
     @property
     def logging(self) -> dict[str, Any]:
         return self.section("logging")
+
+
+def database_url(config: RuntimeConfig | None = None) -> str:
+    """Build the mandatory PostgreSQL connection URL from local environment.
+
+    Credentials stay outside tracked YAML files. ``PAPER_DATABASE_URL`` may be
+    used for a complete URL, otherwise the individual ``PAPER_DB_*`` values
+    are assembled with SQLAlchemy so special characters in the password are
+    escaped correctly.
+    """
+    config = config or RUNTIME_CONFIG
+    direct = str(os.getenv("PAPER_DATABASE_URL") or "").strip()
+    configured = str(config.storage.get("database_url") or "").strip()
+    raw = direct or configured
+    if raw:
+        if raw.startswith("sqlite:"):
+            raise RuntimeError("项目运行数据库必须是 PostgreSQL，不再支持 SQLite 默认回退")
+        if not raw.startswith("postgresql+psycopg://"):
+            raise RuntimeError("数据库连接必须使用 postgresql+psycopg:// 驱动")
+        return raw
+
+    required = {
+        "host": os.getenv("PAPER_DB_HOST"),
+        "port": os.getenv("PAPER_DB_PORT", "5432"),
+        "database": os.getenv("PAPER_DB_NAME"),
+        "username": os.getenv("PAPER_DB_USER"),
+        "password": os.getenv("PAPER_DB_PASSWORD"),
+    }
+    missing = [name for name, value in required.items() if not str(value or "").strip()]
+    if missing:
+        raise RuntimeError(
+            "未配置 PostgreSQL 连接信息，请设置 PAPER_DB_HOST、PAPER_DB_NAME、"
+            "PAPER_DB_USER、PAPER_DB_PASSWORD（可选 PAPER_DB_PORT）"
+        )
+    query = {}
+    sslmode = str(os.getenv("PAPER_DB_SSLMODE") or "").strip()
+    if sslmode:
+        query["sslmode"] = sslmode
+    return URL.create(
+        "postgresql+psycopg",
+        username=str(required["username"]),
+        password=str(required["password"]),
+        host=str(required["host"]),
+        port=int(str(required["port"])),
+        database=str(required["database"]),
+        query=query,
+    ).render_as_string(hide_password=False)
 
 
 _CONFIG: RuntimeConfig | None = None

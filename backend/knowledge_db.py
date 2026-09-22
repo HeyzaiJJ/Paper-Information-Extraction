@@ -1,10 +1,11 @@
-"""SQLite persistence for explicitly archived knowledge-base content."""
+"""PostgreSQL persistence for explicitly archived knowledge-base content."""
 
 from __future__ import annotations
 
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+import re
 import uuid
 from typing import Any, Literal
 
@@ -17,14 +18,12 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     create_engine,
-    event,
     func,
     select,
 )
-from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
 
-from backend.runtime_config import BASE_DIR, RUNTIME_CONFIG
+from backend.runtime_config import BASE_DIR, RUNTIME_CONFIG, database_url
 from backend.temp_assets import document_dir, read_json
 
 
@@ -33,11 +32,7 @@ def _utcnow() -> datetime:
 
 
 def _database_url() -> str:
-    raw = str(RUNTIME_CONFIG.storage.get("database_url") or "sqlite:///data/marker_web.sqlite3")
-    if raw.startswith("sqlite:///") and not raw.startswith("sqlite:////"):
-        relative = raw[len("sqlite:///") :]
-        return "sqlite:///" + str((BASE_DIR / relative).resolve()).replace("\\", "/")
-    return raw
+    return database_url(RUNTIME_CONFIG)
 
 
 class Base(DeclarativeBase):
@@ -165,22 +160,8 @@ class KnowledgeFolderReport(Base):
     report: Mapped[AnalysisReport] = relationship(back_populates="folder_links")
 
 
-ENGINE = create_engine(
-    _database_url(),
-    future=True,
-    connect_args={"check_same_thread": False, "timeout": 30},
-)
-
-
-@event.listens_for(Engine, "connect")
-def _sqlite_pragmas(dbapi_connection, _connection_record):
-    if not _database_url().startswith("sqlite:"):
-        return
-    cursor = dbapi_connection.cursor()
-    cursor.execute("PRAGMA foreign_keys=ON")
-    cursor.execute("PRAGMA journal_mode=WAL")
-    cursor.execute("PRAGMA busy_timeout=30000")
-    cursor.close()
+_DATABASE_URL = _database_url()
+ENGINE = create_engine(_DATABASE_URL, future=True, pool_pre_ping=True)
 
 
 SessionLocal = sessionmaker(bind=ENGINE, expire_on_commit=False, future=True)
@@ -193,16 +174,13 @@ class ArchiveConflict(RuntimeError):
 
 
 def init_database() -> None:
-    db_path = Path(_database_url().replace("sqlite:///", "")) if _database_url().startswith("sqlite:///") else None
-    if db_path:
-        db_path.parent.mkdir(parents=True, exist_ok=True)
     from sqlalchemy import inspect
     from alembic import command
     from alembic.config import Config
 
     alembic_config = Config(str(BASE_DIR / "alembic.ini"))
     alembic_config.set_main_option("script_location", str(BASE_DIR / "alembic"))
-    alembic_config.set_main_option("sqlalchemy.url", _database_url())
+    alembic_config.set_main_option("sqlalchemy.url", _database_url().replace("%", "%%"))
     inspector = inspect(ENGINE)
     existing_schema = inspector.has_table("knowledge_articles")
     versioned = inspector.has_table("alembic_version")
@@ -389,9 +367,54 @@ def archive_document(
     return get_report(report_id)
 
 
+_MARKER_PAGE_IMAGE_RE = re.compile(
+    r"^_page_(\d+)_(?:figure|picture|chart|diagram)_(\d+)",
+    re.IGNORECASE,
+)
+
+
+def _fallback_figure_image_ids(article: KnowledgeArticle) -> dict[str, str]:
+    """Recover an unbound FigureIndex image from Marker's page assets.
+
+    A few Marker layouts expose the complete image in the page asset list but
+    omit the Figure/Caption relationship.  Use the fallback only when a page
+    has the same number of numbered figures and ordered visual assets, so an
+    unrelated page image can never be guessed into a report.
+    """
+    figures_by_page: dict[int, list[KnowledgeFigure]] = {}
+    for figure in article.figures:
+        if figure.page_number is not None:
+            figures_by_page.setdefault(int(figure.page_number), []).append(figure)
+
+    images_by_page: dict[int, list[tuple[int, KnowledgeImage]]] = {}
+    for image in article.images:
+        if image.source != "marker_markdown":
+            continue
+        match = _MARKER_PAGE_IMAGE_RE.match(str(image.marker_name or ""))
+        if match:
+            images_by_page.setdefault(int(match.group(1)), []).append((int(match.group(2)), image))
+
+    recovered: dict[str, str] = {}
+    for page, figures in figures_by_page.items():
+        candidates = images_by_page.get(page, [])
+        if len(candidates) != len(figures):
+            continue
+        def figure_sort_key(item: KnowledgeFigure) -> tuple[int, str]:
+            number = re.search(r"\d+", item.figure_key or "")
+            return (int(number.group(0)) if number else 10**9, item.figure_key)
+
+        figures.sort(key=figure_sort_key)
+        candidates.sort(key=lambda item: item[0])
+        for figure, (_, image) in zip(figures, candidates):
+            if not figure.image_id:
+                recovered[figure.id] = image.id
+    return recovered
+
+
 def _report_dict(report: AnalysisReport) -> dict[str, Any]:
     parts = json.loads(report.parts_json or "{}")
     folder_ids = [link.folder_id for link in report.folder_links]
+    fallback_image_ids = _fallback_figure_image_ids(report.article)
     figure_index = [{
         "id": figure.figure_key,
         "label": figure.label,
@@ -401,9 +424,10 @@ def _report_dict(report: AnalysisReport) -> dict[str, Any]:
         "position": figure.position,
         "marker_block_id": figure.marker_block_id,
         "node_type": figure.node_type,
-        "image_id": figure.image_id,
-        "image_url": f"/api/knowledge/assets/{figure.image_id}" if figure.image_id else "",
-    } for figure in report.article.figures]
+        "image_id": image_id,
+        "image_url": f"/api/knowledge/assets/{image_id}" if image_id else "",
+    } for figure in report.article.figures
+      for image_id in [figure.image_id or fallback_image_ids.get(figure.id)]]
     return {
         "id": report.id,
         "sourceReportId": report.source_report_id,

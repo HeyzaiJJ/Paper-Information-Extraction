@@ -9,7 +9,7 @@ marker:
 
 remote_inference:
   backend: vllm
-  base_url: "http://192.168.11.13:8000/v1"
+  base_url: "http://192.168.11.13:8456/v1"
   autostart: false
   parallel: 8
   timeout_seconds: 600
@@ -37,7 +37,8 @@ conversion:
   export_ttl_hours: 24
 
 storage:
-  database_url: "sqlite:///data/marker_web.sqlite3"
+  # Database credentials are supplied via PAPER_DB_* environment variables.
+  database_url: ""
   image_backend: database
   vlm_max_edge: 2048
   thumbnail_max_edge: 600

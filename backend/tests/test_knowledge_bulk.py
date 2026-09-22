@@ -1,7 +1,34 @@
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
+from types import SimpleNamespace
 
 import backend.knowledge_db as db
+
+
+def test_missing_figure_image_recovers_from_ordered_marker_page_assets():
+    figures = [
+        SimpleNamespace(id="db-fig2", figure_key="fig2", page_number=3, image_id=None),
+        SimpleNamespace(id="db-fig3", figure_key="fig3", page_number=3, image_id="repaired-fig3"),
+    ]
+    images = [
+        SimpleNamespace(id="marker-fig3", source="marker_markdown", marker_name="_page_3_Figure_5.jpeg"),
+        SimpleNamespace(id="marker-fig2", source="marker_markdown", marker_name="_page_3_Figure_2.jpeg"),
+        SimpleNamespace(id="derived", source="figure_index", marker_name="fig3.png"),
+    ]
+
+    recovered = db._fallback_figure_image_ids(SimpleNamespace(figures=figures, images=images))
+
+    assert recovered == {"db-fig2": "marker-fig2"}
+
+
+def test_missing_figure_image_is_not_guessed_when_page_counts_disagree():
+    figures = [SimpleNamespace(id="db-fig2", figure_key="fig2", page_number=3, image_id=None)]
+    images = [
+        SimpleNamespace(id="one", source="marker_markdown", marker_name="_page_3_Figure_2.jpeg"),
+        SimpleNamespace(id="two", source="marker_markdown", marker_name="_page_3_Figure_5.jpeg"),
+    ]
+
+    assert db._fallback_figure_image_ids(SimpleNamespace(figures=figures, images=images)) == {}
 
 
 def _seed_database(tmp_path, monkeypatch):

@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{{ title }}</title>
-  <link rel="stylesheet" href="/static/style.css?v=20260827-control-layout3">
+  <link rel="stylesheet" href="/static/style.css?v=20260903-report-rendering1">
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/katex.min.css">
   <!-- 用于把 markdown 渲染成可读预览；离线时自动降级为纯文本 -->
 </head>
@@ -13,18 +13,22 @@
 
     <!-- ========== 左侧选择栏 ========== -->
     <aside class="sidebar">
-      <div class="sidebar-title">功能选择</div>
-      <button type="button" class="nav-btn active" id="nav-pdf" data-ws="ws-pdf">
-        <span class="nav-icon">📄</span> PDF文件转换
+      <div class="sidebar-brand" aria-label="Paper Lab">
+        <span class="sidebar-brand-mark" aria-hidden="true"><span></span><span></span><span></span></span>
+        <span class="sidebar-brand-copy"><strong>Paper Lab</strong></span>
+      </div>
+      <div class="sidebar-title">工作区</div>
+      <button type="button" class="nav-btn active" id="nav-pdf" data-ws="ws-pdf" title="PDF文件转换">
+        <span class="nav-icon">📄</span><span class="nav-label">PDF文件转换</span>
       </button>
-      <button type="button" class="nav-btn" id="nav-material" data-ws="ws-material">
-        <span class="nav-icon">🧪</span> 针对材料信息提取
+      <button type="button" class="nav-btn" id="nav-material" data-ws="ws-material" title="材研智析">
+        <span class="nav-icon">🧪</span><span class="nav-label">材研智析</span>
       </button>
-      <button type="button" class="nav-btn" id="nav-knowledge" data-ws="ws-knowledge">
-        <span class="nav-icon">🗂️</span> 知识库
+      <button type="button" class="nav-btn" id="nav-knowledge" data-ws="ws-knowledge" title="知识库">
+        <span class="nav-icon">🗂️</span><span class="nav-label">知识库</span>
       </button>
-      <button type="button" class="nav-btn is-hidden" id="nav-paper" data-ws="ws-paper">
-        <span class="nav-icon">🔎</span> 论文信息提取
+      <button type="button" class="nav-btn is-hidden" id="nav-paper" data-ws="ws-paper" title="论文信息提取">
+        <span class="nav-icon">🔎</span><span class="nav-label">论文信息提取</span>
       </button>
     </aside>
 
@@ -35,10 +39,10 @@
       <section class="workspace" id="ws-pdf">
         <div class="wrap">
           <div class="pdf-control-area">
-            <h1>PDF 文件转换</h1>
+            <div class="page-heading"><h1>PDF 文件转换</h1></div>
             <div class="card">
               <form id="convert-form">
-                <label>选择 PDF（可多选；点每个文件右侧的 × 删除单个）</label>
+                <div class="pdf-upload-head"><div><span class="pdf-section-kicker">文件输入</span><strong>添加 PDF 文件</strong></div><span class="pdf-upload-hint">支持多选 · 最多同时转换 3 篇</span></div>
                 <div class="dropzone" id="dropzone">
                   <input type="file" id="file-input" accept="application/pdf" multiple hidden>
                   <button type="button" class="choose" id="choose-btn">＋ 选择文件</button>
@@ -48,7 +52,7 @@
 
                 <button type="submit" id="submit-btn">转换</button>
                 <div class="progress-list is-hidden" id="progress"></div>
-                <div class="tip">固定使用 Marker 2.0 balanced 模式，最多同时转换 3 篇。完成后直接下载 ZIP；每篇论文包含 Markdown、JSON 元数据和独立 images 文件夹，压缩包路径已做短化以兼容 Windows 解压。</div>
+                <div class="tip">完成后直接下载 ZIP。</div>
                 <div class="status" id="status"></div>
               </form>
             </div>
@@ -117,23 +121,23 @@
       <!-- ======== 工作区 3：针对材料信息提取（V2） ======== -->
       <section class="workspace is-hidden" id="ws-material">
         <div id="material-workspace-v2">
-          <section class="mw-shell" aria-label="材料信息提取工作区">
+          <section class="mw-shell" aria-label="材研智析工作区">
             <main class="mw-main">
-              <header class="mw-header"><div><h2>材料信息提取</h2></div><div class="mw-header-status"><span class="mw-dot" aria-hidden="true"></span><span id="mw-header-status-text">暂无提取任务</span></div></header>
+              <header class="mw-header"><div class="mw-header-copy"><h2>材研智析</h2></div><div class="mw-header-status"><span class="mw-dot" aria-hidden="true"></span><span id="mw-header-status-text">暂无提取任务</span></div></header>
               <div class="mw-result-stage">
                 <section class="mw-control" id="mw-control" aria-label="提取控制区">
-                  <div class="mw-control-body" id="mw-control-body"><table class="mw-files-table"><thead><tr><th scope="col"><span class="mw-sr-only">选择</span></th><th scope="col">文件名</th><th scope="col">提取部分</th><th scope="col">PDF 解析</th><th scope="col">操作</th></tr></thead><tbody id="mw-files-body"></tbody></table><div class="mw-empty-note" id="mw-files-empty">暂无 PDF。请先在 PDF 文件转换工作区转换并加入材料提取，或继续添加本地 PDF。</div></div>
+                  <div class="mw-control-body" id="mw-control-body"><table class="mw-files-table"><thead><tr><th scope="col"><span class="mw-sr-only">选择</span></th><th scope="col">文件名</th><th scope="col">提取部分</th><th scope="col">PDF 解析</th><th scope="col">操作</th></tr></thead><tbody id="mw-files-body"></tbody></table><div class="mw-empty-note" id="mw-files-empty">暂无 PDF，请从转换区加入或直接添加。</div></div>
                   <div class="mw-control-foot">
                     <div class="mw-add-file-row">
-                      <button class="mw-link-button" type="button" id="mw-add-file"><i data-lucide="plus" aria-hidden="true"></i><span>继续添加 PDF</span></button>
+                      <button class="mw-link-button" type="button" id="mw-add-file"><i data-lucide="plus" aria-hidden="true"></i><span>添加 PDF</span></button>
                       <input type="file" id="mw-add-file-input" accept="application/pdf,.pdf" multiple hidden>
                     </div>
                     <div class="mw-extraction-options-row">
-                      <div class="mw-execute-row"><button class="mw-start" id="mw-start" type="button" disabled>请选择</button><select class="mw-select" id="mw-model" aria-label="选择模型"></select></div>
+                      <div class="mw-execute-row"><div class="mw-model-field"><div class="mw-model-picker" id="mw-model-picker"><button class="mw-model-trigger" id="mw-model-trigger" type="button" aria-label="选择模型" aria-haspopup="listbox" aria-expanded="false" aria-controls="mw-model-menu"><span id="mw-model-value">选择模型</span><i data-lucide="chevron-down" class="mw-model-chevron" aria-hidden="true"></i></button><ul class="mw-model-menu" id="mw-model-menu" role="listbox" aria-label="模型列表"></ul><select class="mw-select-native" id="mw-model" tabindex="-1" aria-hidden="true"></select></div></div><button class="mw-start" id="mw-start" type="button" disabled>请选择</button></div>
                     </div>
                   </div>
                 </section>
-                <section class="mw-results" aria-label="提取结果"><header class="mw-results-head"><h3>提取结果</h3><span id="mw-results-count">0 个文件</span></header><div class="mw-results-grid"><div class="mw-result-list" id="mw-result-list" role="listbox" aria-label="结果文件"></div><article class="mw-detail" id="mw-detail" aria-live="polite"><div class="mw-detail-empty mw-empty-note" id="mw-detail-empty">选择左侧结果文件查看报告。</div><div class="mw-detail-content is-hidden" id="mw-detail-content"><div class="mw-detail-head"><div class="mw-detail-title"><h3 id="mw-detail-name"></h3></div><div class="mw-detail-actions"><button class="mw-action-button" id="mw-export" type="button" data-tooltip="导出报告"><i data-lucide="download" aria-hidden="true"></i><span>导出</span></button><button class="mw-action-button" id="mw-archive" type="button" data-tooltip="归档到知识库"><i data-lucide="archive" aria-hidden="true"></i><span>归档</span></button></div></div><div class="mw-tab-row" id="mw-tab-row" role="tablist" aria-label="报告部分" aria-multiselectable="false"></div><div class="mw-report" id="mw-report"></div></div></article></div></section>
+                <section class="mw-results" aria-label="提取结果"><header class="mw-results-head"><h3>提取结果</h3><span id="mw-results-count">0 个文件</span></header><div class="mw-results-grid"><div class="mw-result-list" id="mw-result-list" role="listbox" aria-label="结果文件"></div><article class="mw-detail" id="mw-detail" aria-live="polite"><div class="mw-detail-empty mw-empty-note" id="mw-detail-empty">暂无提取结果，完成提取后会显示在这里。</div><div class="mw-detail-content is-hidden" id="mw-detail-content"><div class="mw-detail-head"><div class="mw-detail-title"><h3 id="mw-detail-name"></h3></div><div class="mw-detail-actions"><button class="mw-action-button" id="mw-export" type="button" data-tooltip="导出报告"><i data-lucide="download" aria-hidden="true"></i><span>导出</span></button><button class="mw-action-button" id="mw-archive" type="button" data-tooltip="归档到知识库"><i data-lucide="archive" aria-hidden="true"></i><span>归档</span></button></div></div><div class="mw-tab-row" id="mw-tab-row" role="tablist" aria-label="报告部分" aria-multiselectable="false"></div><div class="mw-report" id="mw-report"></div></div></article></div></section>
               </div>
             </main>
           </section>
@@ -149,7 +153,7 @@
               <div>
                 <h1 class="knowledge-title">知识库</h1>
               </div>
-              <button type="button" class="knowledge-icon-btn" id="knowledge-new-folder-icon" title="新建归档文件夹" aria-label="新建归档文件夹">＋</button>
+              <button type="button" class="knowledge-icon-btn" id="knowledge-new-folder-icon" title="新建归档文件夹" aria-label="新建归档文件夹">新建文件夹</button>
             </div>
             <div class="knowledge-search-wrap">
               <input type="search" id="knowledge-search" class="knowledge-search" placeholder="搜索文件夹或论文" aria-label="搜索文件夹或论文">
@@ -157,7 +161,7 @@
             <div class="knowledge-tree" id="knowledge-tree"></div>
           </aside>
 
-          <div class="knowledge-splitter" id="knowledge-splitter" role="separator" aria-orientation="vertical" aria-label="调整知识库目录宽度"></div>
+          <div class="knowledge-splitter" id="knowledge-splitter" role="separator" tabindex="0" aria-orientation="vertical" aria-label="调整知识库目录宽度" aria-valuemin="240" aria-valuemax="520" aria-valuenow="300"></div>
 
           <section class="knowledge-content" id="knowledge-content" aria-live="polite"></section>
         </div>
@@ -292,8 +296,8 @@
   <script src="https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/katex.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/contrib/auto-render.min.js"></script>
   <script src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js"></script>
-  <script src="/static/app.js?v=20260827-pdf-process-tree2"></script>
-  <script src="/static/material-workspace-preview.js?v=20260827-pdf-process-tree2"></script>
+  <script src="/static/app.js?v=20260903-figure-citations2"></script>
+  <script src="/static/material-workspace-preview.js?v=20260903-report-rendering1"></script>
 </body>
 </html>
 

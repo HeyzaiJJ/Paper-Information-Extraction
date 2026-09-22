@@ -7,7 +7,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from backend.preprocess.pdf_figures import _figure_regions
+from backend.preprocess.pdf_figures import _figure_regions, marker_figure_anchor_links
 
 
 def _page3_payload(*children):
@@ -120,3 +120,30 @@ def test_equal_distance_candidates_are_left_unassigned():
     )
 
     assert _figure_regions(json.dumps(payload)) == []
+
+
+def test_caption_prefers_visual_immediately_above_over_next_visual():
+    # Real papers often place the next figure directly after the previous
+    # caption.  Centre distance alone then assigns both captions to the second
+    # visual and leaves the first Fig. reference without an image.
+    payload = _page3_payload(
+        _figure("/page/3/Figure/2", [49, 55, 543, 407]),
+        _caption(2, [48, 414, 291, 448]),
+        _figure("/page/3/Figure/5", [48, 473, 290, 667]),
+        _caption(3, [48, 675, 291, 698]),
+    )
+
+    regions = {item["id"]: item for item in _figure_regions(json.dumps(payload))}
+
+    assert regions["fig2"]["bbox"] == (49.0, 55.0, 543.0, 407.0)
+    assert regions["fig3"]["bbox"] == (48.0, 473.0, 290.0, 667.0)
+
+
+def test_marker_figure_anchor_links_keep_explicit_composite_targets():
+    anchors, links = marker_figure_anchor_links(
+        '<p><a href="#page-7-1">Figs. 11 and 12</a></p>'
+        '<span id="page-7-1"></span>'
+    )
+
+    assert anchors == {"page-7-1"}
+    assert links == [("page-7-1", ["fig11", "fig12"])]
